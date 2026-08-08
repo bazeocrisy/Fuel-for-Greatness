@@ -1,0 +1,16 @@
+{
+  // Fuel for Greatness — Cloudflare Worker + Static Assets
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fuel-for-greatness",
+  "main": "worker.js",
+  "compatibility_date": "2025-08-01",
+  "assets": {
+    // Serve the repo root as the static site, minus everything in .assetsignore
+    "directory": "./",
+    "binding": "ASSETS",
+    // The Worker runs BEFORE static assets for these paths, so /api/submit is
+    // real server-side code and never resolves to a static file.
+    "run_worker_first": ["/api/*"]
+  },
+  "observability": { "enabled": true }
+}

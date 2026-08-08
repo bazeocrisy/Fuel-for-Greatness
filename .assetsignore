@@ -1,0 +1,19 @@
+# Never publish these as public website assets
+.git
+.git/**
+.github
+.github/**
+.wrangler
+.wrangler/**
+node_modules
+node_modules/**
+worker.js
+wrangler.jsonc
+wrangler.toml
+package.json
+package-lock.json
+README.md
+.gitignore
+.assetsignore
+functions
+functions/**
