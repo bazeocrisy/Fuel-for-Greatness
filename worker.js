@@ -21,8 +21,25 @@ export default {
     const url = new URL(request.url);
     const p = url.pathname;
 
+    // Parent Portal pages (protected by Cloudflare Access on /parent*)
+    if (p === '/parent' || p === '/parent/' || p.startsWith('/parent/')) {
+      const guard = accessGuard(request, env);
+      if (guard) return guard;
+      return env.ASSETS.fetch(new Request(new URL('/parent.html', url.origin), request));
+    }
+
     if (p.startsWith('/api/')) {
       let m;
+      if (p.startsWith('/api/parent/')) {
+        const guard = accessGuard(request, env);
+        if (guard) return guard;
+        if (request.method !== 'GET') return json({ success: false, message: 'Method not allowed' }, 405);
+        if (p === '/api/parent/children') return parentChildren(env);
+        if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/profile$/))) return parentProfile(env, m[1]);
+        if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/report\.pdf$/))) return parentReport(env, m[1]);
+        if (p === '/api/parent/compare') return parentCompare(env);
+        return json({ success: false, message: 'Not found' }, 404);
+      }
       if ((m = p.match(/^\/api\/child\/([a-z0-9-]+)\/profile$/))) {
         if (request.method !== 'POST') return json({ success: false, message: 'Method not allowed' }, 405);
         return saveChildProfile(request, env, m[1]);
@@ -37,6 +54,146 @@ export default {
     return env.ASSETS.fetch(request);
   },
 };
+
+/* ------------------------------------------------------------ parent access
+   Cloudflare Access enforces authentication at the edge on /parent* and
+   /api/parent/* — it runs before this Worker, so by the time a request arrives
+   it is already authenticated. This is a belt-and-braces check: set the
+   PARENT_GUARD variable to "strict" once Access is live and the Worker will
+   additionally refuse any request that arrives without an Access identity.   */
+
+function accessGuard(request, env) {
+  if (String(env.PARENT_GUARD || '').toLowerCase() !== 'strict') return null;
+  const email = request.headers.get('cf-access-authenticated-user-email');
+  const jwt = request.headers.get('cf-access-jwt-assertion');
+  if (email || jwt) return null;
+  return json({ success: false, message: 'Parent sign-in required.' }, 403);
+}
+
+/* --------------------------------------------------------- parent: reads */
+
+async function parentChildren(env) {
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const kids = (await env.DB.prepare(
+    'SELECT id, slug, full_name, first_name, grade, accent, active_session_id, updated_at FROM children ORDER BY id'
+  ).all()).results || [];
+
+  const out = [];
+  for (const k of kids) {
+    const approved = await env.DB.prepare(
+      "SELECT id, version, completed_at, total_selected FROM profile_sessions WHERE child_id = ? AND status = 'approved' ORDER BY version DESC LIMIT 1"
+    ).bind(k.id).first();
+    const pending = await env.DB.prepare(
+      "SELECT id, version, completed_at, total_selected FROM profile_sessions WHERE child_id = ? AND status = 'pending' ORDER BY version DESC LIMIT 1"
+    ).bind(k.id).first();
+    const counts = await env.DB.prepare(
+      'SELECT (SELECT COUNT(*) FROM child_food_preferences WHERE child_id = ?1) AS liked, (SELECT COUNT(*) FROM child_category_responses WHERE child_id = ?1) AS answered, (SELECT COUNT(*) FROM child_category_responses WHERE child_id = ?1 AND none_selected = 1) AS none'
+    ).bind(k.id).first();
+
+    out.push({
+      slug: k.slug, fullName: k.full_name, firstName: k.first_name, grade: k.grade, accent: k.accent,
+      status: approved ? 'complete' : 'none',
+      version: approved ? approved.version : null,
+      lastUpdated: approved ? approved.completed_at : null,
+      totalFavorites: Number((counts && counts.liked) || 0),
+      categoriesAnswered: Number((counts && counts.answered) || 0),
+      categoriesNone: Number((counts && counts.none) || 0),
+      pending: pending ? { version: pending.version, completedAt: pending.completed_at, totalSelected: pending.total_selected } : null,
+    });
+  }
+  return json({ success: true, family: 'Bazemore Family', children: out });
+}
+
+async function loadApproved(env, slug) {
+  const child = await env.DB.prepare('SELECT id, slug, full_name, first_name, grade, accent FROM children WHERE slug = ?').bind(slug).first();
+  if (!child) return null;
+  const cats = (await env.DB.prepare('SELECT id, slug, display_name, emoji, sort_order FROM food_categories ORDER BY sort_order').all()).results || [];
+  const prefs = (await env.DB.prepare(
+    'SELECT f.name, f.emoji, f.category_id FROM child_food_preferences p JOIN food_items f ON f.id = p.food_item_id WHERE p.child_id = ? ORDER BY f.name'
+  ).bind(child.id).all()).results || [];
+  const responses = (await env.DB.prepare('SELECT category_id, answered, none_selected, updated_at FROM child_category_responses WHERE child_id = ?').bind(child.id).all()).results || [];
+  const session = await env.DB.prepare(
+    "SELECT version, completed_at, total_selected FROM profile_sessions WHERE child_id = ? AND status = 'approved' ORDER BY version DESC LIMIT 1"
+  ).bind(child.id).first();
+  const pending = await env.DB.prepare(
+    "SELECT version, completed_at, total_selected FROM profile_sessions WHERE child_id = ? AND status = 'pending' ORDER BY version DESC LIMIT 1"
+  ).bind(child.id).first();
+
+  const respBy = new Map(responses.map((r) => [r.category_id, r]));
+  const categories = cats.map((c) => {
+    const items = prefs.filter((p) => p.category_id === c.id).map((p) => ({ name: p.name, emoji: p.emoji }));
+    const r = respBy.get(c.id);
+    return {
+      slug: c.slug, name: c.display_name, emoji: c.emoji,
+      items, count: items.length,
+      answered: !!(r && r.answered), noneSelected: !!(r && r.none_selected),
+    };
+  });
+  return { child, session, pending, categories };
+}
+
+async function parentProfile(env, slug) {
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const data = await loadApproved(env, slug);
+  if (!data) return json({ success: false, message: 'Unknown child.' }, 404);
+  return json({
+    success: true,
+    child: { slug: data.child.slug, fullName: data.child.full_name, firstName: data.child.first_name, grade: data.child.grade, accent: data.child.accent },
+    approved: data.session ? { version: data.session.version, completedAt: data.session.completed_at, totalSelected: data.session.total_selected } : null,
+    pending: data.pending ? { version: data.pending.version, completedAt: data.pending.completed_at, totalSelected: data.pending.total_selected } : null,
+    totalFavorites: data.categories.reduce((a, c) => a + c.count, 0),
+    categories: data.categories,
+  });
+}
+
+async function parentCompare(env) {
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const a = await loadApproved(env, 'gabriella');
+  const b = await loadApproved(env, 'christopher');
+  if (!a || !b) return json({ success: false, message: 'Both children need a profile first.' }, 404);
+
+  const byCat = a.categories.map((ca, i) => {
+    const cb = b.categories[i] || { items: [] };
+    const A = new Set(ca.items.map((x) => x.name));
+    const B = new Set(cb.items.map((x) => x.name));
+    return {
+      name: ca.name, emoji: ca.emoji, slug: ca.slug,
+      both: [...A].filter((n) => B.has(n)).sort(),
+      onlyA: [...A].filter((n) => !B.has(n)).sort(),
+      onlyB: [...B].filter((n) => !A.has(n)).sort(),
+    };
+  });
+  const flat = (key) => byCat.reduce((acc, c) => acc.concat(c[key]), []);
+  return json({
+    success: true,
+    a: { slug: 'gabriella', firstName: a.child.first_name, accent: a.child.accent },
+    b: { slug: 'christopher', firstName: b.child.first_name, accent: b.child.accent },
+    overall: { both: flat('both'), onlyA: flat('onlyA'), onlyB: flat('onlyB') },
+    categories: byCat,
+  });
+}
+
+async function parentReport(env, slug) {
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const child = await env.DB.prepare('SELECT id, slug FROM children WHERE slug = ?').bind(slug).first();
+  if (!child) return json({ success: false, message: 'Unknown child.' }, 404);
+  const session = await env.DB.prepare(
+    "SELECT snapshot_json FROM profile_sessions WHERE child_id = ? AND status = 'approved' ORDER BY version DESC LIMIT 1"
+  ).bind(child.id).first();
+  if (!session) return json({ success: false, message: 'No approved profile yet.' }, 404);
+
+  let payload;
+  try { payload = JSON.parse(session.snapshot_json); } catch { return json({ success: false, message: 'Stored profile could not be read.' }, 500); }
+  const report = normalize(payload, false);
+  const bytes = buildPdf(report);
+  return new Response(bytes, {
+    headers: {
+      'content-type': 'application/pdf',
+      'content-disposition': 'inline; filename="' + pdfFilename(report) + '"',
+      'cache-control': 'no-store',
+    },
+  });
+}
 
 /* ------------------------------------------------- public: save a profile */
 

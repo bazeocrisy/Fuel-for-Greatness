@@ -3,7 +3,8 @@
 Mobile wizard where Gabriella and Christopher pick the parent-approved foods they actually like. Deployed as a **Cloudflare Worker with static assets**.
 
 ```
-index.html        the whole app (self-contained, no build step)
+index.html        the child wizard (self-contained, no build step)
+parent.html       the Parent Portal (served at /parent, behind Cloudflare Access)
 worker.js         the backend: serves the site + handles POST /api/submit
 wrangler.jsonc    Worker name, entry point, assets + D1 bindings, /api/* routing
                   NOT included in delivery zips after Phase 2 — it holds your real
@@ -94,11 +95,43 @@ If the PDF or the Resend call fails, the Worker returns a failure and the app ke
 
 `index.html` is compiled. Edit `School Lunch Favorites.dc.html` in the design project — the lists live in one block at the top of the logic section (`static CATS` for the nine categories, `static EXTRAS` for dips), each item written as `{ n: 'Name', e: '🍎' }` — then re-export.
 
+## Parent Portal (Phase 4)
+
+Served at **/parent** (the Worker rewrites `/parent*` to `parent.html`). Hash routes:
+`#` dashboard, `#child/<slug>` profile, `#compare`.
+
+Protected API, all GET, all JSON:
+
+| Path | Returns |
+|---|---|
+| `/api/parent/children` | both children: status, version, last updated, favorites count, categories answered, pending update |
+| `/api/parent/children/:slug/profile` | the ACTIVE APPROVED profile by category |
+| `/api/parent/children/:slug/report.pdf` | the branded PDF, generated from the approved session snapshot |
+| `/api/parent/compare` | both-like / only-A / only-B, overall and per category |
+
+### Cloudflare Access setup (do this before sharing the URL)
+
+1. Cloudflare dashboard → **Zero Trust** → Access → Applications → **Add an application** → *Self-hosted*.
+2. Application name: `Fuel for Greatness — Parent Portal`.
+3. Add two paths on your Worker domain (`fuel-for-greatness.bazeocrisy.workers.dev`):
+   `/parent*` and `/api/parent/*`.
+4. Policy: **Allow**, Include → *Emails* → your two parent email addresses.
+5. Login methods: **One-time PIN** (and Google if you want it) — no passwords anywhere.
+6. Save. Visiting `/parent` now asks for an email PIN; the child wizard at `/` stays public.
+7. **Optional belt-and-braces:** add a Worker Variable `PARENT_GUARD` = `strict`. The Worker
+   then refuses any `/parent*` or `/api/parent/*` request that arrives without an Access
+   identity header — protection even if a policy is later removed by accident.
+   Leave it unset until Access is live, or you will lock yourself out.
+
+Nothing about parent auth lives in the repo, in `index.html`, or in client JavaScript.
+
 ## Roadmap
 
 Phase 2 (done): D1 schema + binding.
-Phase 3: the wizard saves completed profiles to D1; email code removed.
-Phases 4–6: Parent Portal dashboard, child profile view + PDF, Compare Profiles.
+Phase 3 (done): the wizard saves completed profiles to D1; email code removed.
+Phase 4 (done): Parent Portal — dashboard, child profile view + PDF, Compare Profiles,
+Access-protected routes.
+Next, on approval: review-and-approve for pending profile updates.
 Then stop — weekly planner, grocery engine and prep plan are a later project.
 
 Parent Portal auth will be **Cloudflare Access** on `/parent*` and `/api/parent/*`.
