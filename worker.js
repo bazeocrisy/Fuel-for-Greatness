@@ -1,105 +1,189 @@
 /**
- * Fuel for Greatness — Cloudflare Worker (Worker + Static Assets)
+ * Fuel for Greatness — Cloudflare Worker (Worker + Static Assets + D1)
  *
- *   GET  /*            → static site via the ASSETS binding (index.html)
- *   POST /api/submit   → this Worker: validates, builds an HTML email + PDF
- *                        report, sends both through Resend to the parents.
+ * PUBLIC (no auth — a child's phone has no login)
+ *   GET  /*                        static site via the ASSETS binding
+ *   POST /api/child/:slug/profile  save a completed food profile to D1
+ *   GET  /api/child/:slug/status   {saved, lastCompletedAt, pending} — no food data
  *
- * Server-side settings (Cloudflare → Settings → Variables & Secrets):
- *   RESEND_API_KEY  (Secret)  Resend API key
- *   FROM_EMAIL      (Variable) verified sender, e.g. lunch@yourdomain.com
- *   TO_EMAILS       (Variable) bazeocrisy@yahoo.com,stepflem30@gmail.com
+ * PARENT (Phase 4+, behind Cloudflare Access on /parent* and /api/parent/*)
+ *   /api/parent/children, .../:slug/profile, .../:slug/report.pdf, /api/parent/compare
  *
- * No credentials ever reach the browser. The browser only ever talks to /api/submit.
+ * Binding: DB (Cloudflare D1). Schema in schema.sql, reference data in seed.sql.
+ * The browser never talks to D1 — only to these endpoints.
  */
+
+const ALLOWED_CHILDREN = ['gabriella', 'christopher'];
+const MAX_BODY = 64 * 1024;
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const p = url.pathname;
 
-    if (url.pathname === '/api/submit') {
-      if (request.method !== 'POST') return json({ success: false, message: 'Method not allowed' }, 405);
-      return handleSubmit(request, env);
+    if (p.startsWith('/api/')) {
+      let m;
+      if ((m = p.match(/^\/api\/child\/([a-z0-9-]+)\/profile$/))) {
+        if (request.method !== 'POST') return json({ success: false, message: 'Method not allowed' }, 405);
+        return saveChildProfile(request, env, m[1]);
+      }
+      if ((m = p.match(/^\/api\/child\/([a-z0-9-]+)\/status$/))) {
+        if (request.method !== 'GET') return json({ success: false, message: 'Method not allowed' }, 405);
+        return childStatus(env, m[1]);
+      }
+      return json({ success: false, message: 'Not found' }, 404);
     }
-    if (url.pathname.startsWith('/api/')) return json({ success: false, message: 'Not found' }, 404);
 
     return env.ASSETS.fetch(request);
   },
 };
 
-/* ------------------------------------------------------------------ submit */
+/* ------------------------------------------------- public: save a profile */
 
-async function handleSubmit(request, env) {
-  // Cheap abuse guard: a real profile is a few KB at most.
-  const declared = Number(request.headers.get('content-length') || 0);
-  if (declared > 64 * 1024) return json({ success: false, message: 'Submission too large.' }, 413);
+async function saveChildProfile(request, env, slug) {
+  if (!ALLOWED_CHILDREN.includes(slug)) return json({ success: false, message: 'Unknown child.' }, 404);
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
 
+  // Size guard before any parsing or database work.
+  if (Number(request.headers.get('content-length') || 0) > MAX_BODY) {
+    return json({ success: false, message: 'Submission too large.' }, 413);
+  }
   let data;
   try {
     const raw = await request.text();
-    if (raw.length > 64 * 1024) return json({ success: false, message: 'Submission too large.' }, 413);
+    if (raw.length > MAX_BODY) return json({ success: false, message: 'Submission too large.' }, 413);
     data = JSON.parse(raw);
   } catch {
     return json({ success: false, message: 'Invalid JSON body.' }, 400);
   }
-
-  if (!data || !data.child || !data.selections || typeof data.selections !== 'object') {
+  if (!data || typeof data !== 'object' || !data.selections || typeof data.selections !== 'object') {
     return json({ success: false, message: 'Submission data is incomplete.' }, 400);
   }
 
-  const isTest = data.testMode === true;
-  const report = normalize(data, isTest);
-
-  const apiKey = env.RESEND_API_KEY;
-  const from = env.FROM_EMAIL;
-  const to = String(env.TO_EMAILS || '').split(',').map((s) => s.trim()).filter(Boolean);
-
-  if (!apiKey || !from || !to.length) {
-    return json(
-      {
-        success: false,
-        configured: false,
-        message: 'Email service is not configured yet.',
-        missing: [!apiKey && 'RESEND_API_KEY', !from && 'FROM_EMAIL', !to.length && 'TO_EMAILS'].filter(Boolean),
-      },
-      503
-    );
+  // Test Mode is accepted so the child sees a normal success screen, and discarded.
+  if (data.testMode === true) {
+    return json({ success: true, saved: false, testMode: true, status: 'discarded', message: 'Test Mode submission — nothing was written to the family database.' });
   }
 
-  let pdfBase64, filename;
-  try {
-    const pdf = buildPdf(report);
-    pdfBase64 = base64(pdf);
-    filename = pdfFilename(report);
-  } catch (err) {
-    return json({ success: false, message: 'Could not generate the parent report PDF.', detail: String(err) }, 500);
-  }
+  const child = await env.DB.prepare('SELECT id, full_name, grade FROM children WHERE slug = ?').bind(slug).first();
+  if (!child) return json({ success: false, message: 'That child is not set up in the database yet.' }, 404);
 
-  try {
-    const res = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from,
-        to,
-        subject: subjectFor(report),
-        html: emailHtml(report),
-        text: emailText(report),
-        attachments: [{ filename, content: pdfBase64 }],
-      }),
-    });
-    if (!res.ok) {
-      const detail = await res.text();
-      return json({ success: false, message: 'Email delivery failed.', detail: detail.slice(0, 400) }, 502);
+  // ---- validate every category and every food name against D1 ----
+  const cats = (await env.DB.prepare('SELECT id, slug, display_name FROM food_categories ORDER BY sort_order').all()).results || [];
+  const items = (await env.DB.prepare('SELECT f.id, f.name, f.category_id FROM food_items f WHERE f.active = 1').all()).results || [];
+  if (!cats.length || !items.length) return json({ success: false, message: 'Reference data missing — apply seed.sql.' }, 503);
+
+  const catByName = new Map(cats.map((c) => [c.display_name, c]));
+  const itemKey = (categoryId, name) => categoryId + '|' + name;
+  const itemIdByKey = new Map(items.map((i) => [itemKey(i.category_id, i.name), i.id]));
+
+  const answeredMap = data.answered && typeof data.answered === 'object' ? data.answered : {};
+  const rows = [];       // {categoryId, foodIds[], noneSelected}
+  const problems = [];
+
+  for (const [name, value] of Object.entries(data.selections)) {
+    const cat = catByName.get(name);
+    if (!cat) { problems.push('Unknown category: ' + name); continue; }
+    const picks = Array.isArray(value) ? value : [];
+    const foodIds = [];
+    for (const foodName of picks) {
+      const id = itemIdByKey.get(itemKey(cat.id, String(foodName)));
+      if (!id) { problems.push('Unknown food in ' + name + ': ' + foodName); continue; }
+      foodIds.push(id);
     }
-    const out = await res.json().catch(() => ({}));
-    return json({ success: true, id: out.id || null, test: isTest });
-  } catch (err) {
-    return json({ success: false, message: 'Email delivery failed.', detail: String(err) }, 502);
+    const answered = answeredMap[name] === true || foodIds.length > 0;
+    rows.push({ categoryId: cat.id, foodIds, answered, noneSelected: answered && foodIds.length === 0 });
   }
+  if (problems.length) return json({ success: false, message: 'Submission rejected.', problems: problems.slice(0, 10) }, 400);
+
+  // Every category must carry an intentional answer — same rule the wizard enforces.
+  const answeredIds = new Set(rows.filter((r) => r.answered).map((r) => r.categoryId));
+  const missing = cats.filter((c) => !answeredIds.has(c.id)).map((c) => c.display_name);
+  if (missing.length) return json({ success: false, message: 'Some categories were not answered.', missing }, 400);
+
+  // ---- versioning: first ever profile auto-approves, later retakes go pending ----
+  const prior = await env.DB.prepare(
+    "SELECT MAX(version) AS maxV, SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approvedCount FROM profile_sessions WHERE child_id = ?"
+  ).bind(child.id).first();
+  const version = Number(prior && prior.maxV ? prior.maxV : 0) + 1;
+  const hasApproved = Number(prior && prior.approvedCount ? prior.approvedCount : 0) > 0;
+  const status = hasApproved ? 'pending' : 'approved';
+
+  const completedAt = safeDate(data.submittedAt);
+  const totalSelected = rows.reduce((a, r) => a + r.foodIds.length, 0);
+
+  const batch = [];
+  // Only the newest pending submission stays reviewable.
+  if (status === 'pending') {
+    batch.push(env.DB.prepare("UPDATE profile_sessions SET status = 'superseded', reviewed_at = datetime('now') WHERE child_id = ? AND status = 'pending'").bind(child.id));
+  }
+  batch.push(
+    env.DB.prepare('INSERT INTO profile_sessions (child_id, version, status, completed_at, reviewed_at, total_selected, snapshot_json, app_build) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(child.id, version, status, completedAt, status === 'approved' ? completedAt : null, totalSelected, JSON.stringify(data), String(data.appBuild || ''))
+  );
+
+  // The preference tables ARE the approved profile — written only on approval.
+  if (status === 'approved') {
+    batch.push(env.DB.prepare('DELETE FROM child_food_preferences WHERE child_id = ?').bind(child.id));
+    batch.push(env.DB.prepare('DELETE FROM child_category_responses WHERE child_id = ?').bind(child.id));
+    for (const r of rows) {
+      batch.push(env.DB.prepare('INSERT INTO child_category_responses (child_id, category_id, answered, none_selected) VALUES (?, ?, 1, ?)').bind(child.id, r.categoryId, r.noneSelected ? 1 : 0));
+      for (const fid of r.foodIds) {
+        batch.push(env.DB.prepare('INSERT OR REPLACE INTO child_food_preferences (child_id, food_item_id, liked) VALUES (?, ?, 1)').bind(child.id, fid));
+      }
+    }
+  }
+
+  try {
+    await env.DB.batch(batch);
+    if (status === 'approved') {
+      const row = await env.DB.prepare('SELECT id FROM profile_sessions WHERE child_id = ? AND version = ?').bind(child.id, version).first();
+      await env.DB.prepare("UPDATE children SET active_session_id = ?, updated_at = datetime('now') WHERE id = ?").bind(row ? row.id : null, child.id).run();
+    }
+  } catch (err) {
+    return json({ success: false, message: 'Could not save the profile.', detail: String(err).slice(0, 300) }, 500);
+  }
+
+  return json({
+    success: true,
+    saved: true,
+    status,
+    version,
+    totalSelected,
+    pendingReview: status === 'pending',
+    message: status === 'approved'
+      ? 'Profile saved and active.'
+      : 'Profile saved. It is waiting for a parent to review the changes; the current profile stays active until then.',
+  });
 }
 
-/* ------------------------------------------------------------- report model */
+/* ------------------------------------------------- public: tiny status ping */
+
+async function childStatus(env, slug) {
+  if (!ALLOWED_CHILDREN.includes(slug)) return json({ success: false, message: 'Unknown child.' }, 404);
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const child = await env.DB.prepare('SELECT id FROM children WHERE slug = ?').bind(slug).first();
+  if (!child) return json({ success: true, saved: false, pending: false, lastCompletedAt: null });
+  const row = await env.DB.prepare(
+    "SELECT MAX(CASE WHEN status = 'approved' THEN completed_at END) AS approvedAt, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pendingCount FROM profile_sessions WHERE child_id = ?"
+  ).bind(child.id).first();
+  return json({
+    success: true,
+    saved: !!(row && row.approvedAt),
+    lastCompletedAt: (row && row.approvedAt) || null,
+    pending: Number((row && row.pendingCount) || 0) > 0,
+  });
+}
+
+function safeDate(v) {
+  const d = v ? new Date(v) : new Date();
+  return (isNaN(d.getTime()) ? new Date() : d).toISOString();
+}
+
+/* ------------------------------------------------------------- report model
+   normalize() + buildPdf() below are the parent report generator, preserved
+   untouched from the email build. They are wired to a route in Phase 5:
+   GET /api/parent/children/:slug/report.pdf (behind Cloudflare Access).       */
 
 const CATEGORY_META = {
   'Proteins': { icon: '💪', color: '#E8720C', rgb: [0.91, 0.45, 0.05] },
@@ -142,112 +226,11 @@ function normalize(data, isTest) {
   };
 }
 
-function subjectFor(r) {
-  return r.isTest
-    ? `[TEST] Fuel for Greatness — ${r.first} Preview`
-    : `Fuel for Greatness — ${r.fullName} — Lunch Food Profile`;
-}
 
 function pdfFilename(r) {
   const day = r.date.toISOString().slice(0, 10);
   const slug = (r.isTest ? `${r.first}-Preview` : r.fullName.replace(/^(Ms\.|Mr\.)\s*/, '')).replace(/[^A-Za-z0-9]+/g, '-');
   return `${r.isTest ? 'TEST_' : ''}Fuel-for-Greatness_${slug}_Lunch-Profile_${day}.pdf`;
-}
-
-/* --------------------------------------------------------------- HTML email */
-
-function emailHtml(r) {
-  const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-  const testBanner = r.isTest
-    ? `<tr><td style="padding:0 0 20px"><table width="100%" cellpadding="0" cellspacing="0" style="background:#FFF4D6;border:2px solid #E0B94A;border-radius:10px"><tr><td style="padding:14px 16px;font:800 15px/1.4 Helvetica,Arial,sans-serif;color:#5A4408">TEST SUBMISSION<br><span style="font-weight:400;font-size:14px">This is a Parent/Test Mode submission and is not the child&rsquo;s final food profile.</span></td></tr></table></td></tr>`
-    : '';
-
-  const summary = r.categories
-    .map(
-      (c) => `<tr>
-        <td style="padding:8px 0;border-bottom:1px solid #EFEAE2;font:700 15px Helvetica,Arial,sans-serif;color:#191410">
-          <span style="display:inline-block;width:10px;height:10px;border-radius:5px;background:${c.meta.color}"></span>&nbsp; ${esc(c.name)}
-        </td>
-        <td align="right" style="padding:8px 0;border-bottom:1px solid #EFEAE2;font:700 15px Helvetica,Arial,sans-serif;color:${c.meta.color}">
-          ${c.items.length ? `${c.items.length} selected` : c.answered ? 'None of these' : 'Not answered'}
-        </td>
-      </tr>`
-    )
-    .join('');
-
-  const details = r.categories
-    .map((c) => {
-      const body = c.items.length
-        ? `<table width="100%" cellpadding="0" cellspacing="0">${c.items
-            .map(
-              (i) =>
-                `<tr><td style="padding:4px 0;font:400 15px Helvetica,Arial,sans-serif;color:#2A2420"><span style="color:${c.meta.color};font-weight:700">&#10003;</span>&nbsp; ${esc(i)}</td></tr>`
-            )
-            .join('')}</table>`
-        : `<div style="font:600 15px Helvetica,Arial,sans-serif;color:#6B7480">${
-            c.answered ? 'No favorites selected &mdash; &ldquo;None of these for me&rdquo;' : 'Not answered'
-          }</div>`;
-      return `<tr><td style="padding:0 0 22px">
-        <div style="border-left:6px solid ${c.meta.color};padding:2px 0 2px 12px;margin-bottom:10px;font:800 17px Helvetica,Arial,sans-serif;color:#191410">${esc(
-        c.meta.icon
-      )} ${esc(c.name)} <span style="font-weight:600;color:#6B7480">&mdash; ${c.items.length} ${
-        c.items.length === 1 ? 'favorite' : 'favorites'
-      }</span></div>
-        ${body}
-      </td></tr>`;
-    })
-    .join('');
-
-  return `<!doctype html><html><body style="margin:0;padding:0;background:#FFF9F0">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#FFF9F0"><tr><td align="center" style="padding:24px 12px">
-<table width="100%" cellpadding="0" cellspacing="0" style="max-width:620px;background:#FFFFFF;border-radius:16px;border:1px solid #EFEAE2">
-<tr><td style="padding:28px 28px 0">
-  <table width="100%" cellpadding="0" cellspacing="0"><tr><td>
-    <div style="font:900 12px Helvetica,Arial,sans-serif;letter-spacing:3px;color:${r.theme.color};text-transform:uppercase">Fuel for Greatness</div>
-    <div style="font:900 26px/1.2 Helvetica,Arial,sans-serif;color:#191410;padding-top:6px">${esc(r.first)}&rsquo;s School Lunch Food Profile</div>
-    <div style="font:700 14px Helvetica,Arial,sans-serif;color:#6B7480;padding-top:8px">FOOD &rarr; FUEL &rarr; FOCUS &rarr; PERFORMANCE</div>
-  </td></tr></table>
-</td></tr>
-<tr><td style="padding:20px 28px 0">
-  ${testBanner}
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#FBF7F1;border-radius:12px">
-    <tr><td style="padding:14px 16px;font:400 15px/1.7 Helvetica,Arial,sans-serif;color:#2A2420">
-      <strong>Child:</strong> ${esc(r.fullName)}<br>
-      <strong>Grade:</strong> ${esc(r.grade)}<br>
-      <strong>Completed:</strong> ${esc(r.timeLabel)}<br>
-      <strong>Total foods selected:</strong> ${r.total}
-    </td></tr>
-  </table>
-</td></tr>
-<tr><td style="padding:24px 28px 0">
-  <div style="font:800 18px Helvetica,Arial,sans-serif;color:#191410;padding-bottom:6px">${esc(r.first)}&rsquo;s Favorites</div>
-  <table width="100%" cellpadding="0" cellspacing="0">${summary}</table>
-</td></tr>
-<tr><td style="padding:26px 28px 0">
-  <div style="font:800 18px Helvetica,Arial,sans-serif;color:#191410;padding-bottom:14px">Every Selection</div>
-  <table width="100%" cellpadding="0" cellspacing="0">${details}</table>
-</td></tr>
-<tr><td style="padding:6px 28px 28px;border-top:1px solid #EFEAE2">
-  <div style="font:400 13px/1.6 Helvetica,Arial,sans-serif;color:#8A929C;padding-top:14px">
-    The full designed report is attached as a PDF.<br>
-    Parents provide the choices. Kids tell us what they like. Together, we build the plan.
-  </div>
-</td></tr>
-</table>
-</td></tr></table>
-</body></html>`;
-}
-
-function emailText(r) {
-  const lines = [];
-  if (r.isTest) lines.push("TEST SUBMISSION — NOT CHILD'S FINAL FOOD PROFILE", '');
-  lines.push('FUEL FOR GREATNESS — School Lunch Food Profile', r.fullName, `Grade: ${r.grade}`, `Completed: ${r.timeLabel}`, `Total foods selected: ${r.total}`, '');
-  for (const c of r.categories) {
-    lines.push(`${c.name} (${c.items.length})`);
-    lines.push(c.items.length ? c.items.map((i) => `  - ${i}`).join('\n') : c.answered ? '  None of these for me (answered intentionally)' : '  Not answered');
-    lines.push('');
-  }
-  return lines.join('\n');
 }
 
 /* ------------------------------------------------------------ PDF generation

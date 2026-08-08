@@ -6,6 +6,8 @@ Mobile wizard where Gabriella and Christopher pick the parent-approved foods the
 index.html        the whole app (self-contained, no build step)
 worker.js         the backend: serves the site + handles POST /api/submit
 wrangler.jsonc    Worker name, entry point, assets + D1 bindings, /api/* routing
+                  NOT included in delivery zips after Phase 2 — it holds your real
+                  D1 database_id. Never overwrite it from a download.
 schema.sql        Cloudflare D1 schema (Phase 2 — apply once)
 seed.sql          D1 reference data: family, children, categories, 201 foods
 ARCHITECTURE.md   the Parent Portal + D1 plan and phase order
