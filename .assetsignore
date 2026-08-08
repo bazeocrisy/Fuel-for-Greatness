@@ -17,3 +17,5 @@ README.md
 .assetsignore
 functions
 functions/**
+*.sql
+*.md

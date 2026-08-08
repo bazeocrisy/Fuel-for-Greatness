@@ -12,5 +12,15 @@
     // real server-side code and never resolves to a static file.
     "run_worker_first": ["/api/*"]
   },
+  // Cloudflare D1 — the family database. Create it in the dashboard (or with
+  //   npx wrangler d1 create fuel-for-greatness
+  // then paste the returned id below. Do not commit a made-up id.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fuel-for-greatness",
+      "database_id": "PASTE_DATABASE_ID_HERE"
+    }
+  ],
   "observability": { "enabled": true }
 }

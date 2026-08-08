@@ -5,8 +5,11 @@ Mobile wizard where Gabriella and Christopher pick the parent-approved foods the
 ```
 index.html        the whole app (self-contained, no build step)
 worker.js         the backend: serves the site + handles POST /api/submit
-wrangler.jsonc    Worker name, entry point, assets binding, /api/* routing
-.assetsignore     keeps .git and backend files off the public site
+wrangler.jsonc    Worker name, entry point, assets + D1 bindings, /api/* routing
+schema.sql        Cloudflare D1 schema (Phase 2 — apply once)
+seed.sql          D1 reference data: family, children, categories, 201 foods
+ARCHITECTURE.md   the Parent Portal + D1 plan and phase order
+.assetsignore     keeps .git, backend and SQL files off the public site
 .gitignore
 README.md
 ```
@@ -20,7 +23,39 @@ GET /   → Worker → env.ASSETS.fetch() → index.html
 
 `run_worker_first: ["/api/*"]` makes the Worker execute before static-asset lookup, so `/api/submit` is genuinely server-side. The browser never talks to Resend and never sees a key.
 
-## Cloudflare setup
+## Cloudflare D1 (Phase 2 — new)
+
+The family database. **Phase 2 adds the schema and the binding only** — no application
+code reads or writes D1 yet, so this deploys safely alongside the working email flow.
+See `ARCHITECTURE.md` for the full plan and phase order.
+
+One-time setup:
+
+1. **Create the database** — dashboard → Storage & Databases → D1 → Create, name it
+   `fuel-for-greatness`. Or from PowerShell:
+   ```powershell
+   npx wrangler d1 create fuel-for-greatness
+   ```
+2. **Paste the returned id** into `wrangler.jsonc`, replacing `PASTE_DATABASE_ID_HERE`.
+   Commit and push.
+3. **Apply the schema and seed data** (once, and again only if the schema changes):
+   ```powershell
+   npx wrangler d1 execute fuel-for-greatness --remote --file=./schema.sql
+   npx wrangler d1 execute fuel-for-greatness --remote --file=./seed.sql
+   ```
+4. **Verify:**
+   ```powershell
+   npx wrangler d1 execute fuel-for-greatness --remote --command "SELECT (SELECT COUNT(*) FROM children) AS children, (SELECT COUNT(*) FROM food_categories) AS categories, (SELECT COUNT(*) FROM food_items) AS foods;"
+   ```
+   Expect `2 / 10 / 201`.
+
+Both SQL files are re-runnable — every statement is `CREATE TABLE IF NOT EXISTS` or
+`INSERT OR IGNORE`, so re-applying never duplicates or destroys data.
+
+`seed.sql` is generated from the wizard's own `CATS`/`EXTRAS`/`KIDS` lists. If you add
+a food to the wizard, regenerate it rather than hand-editing, so the two cannot drift.
+
+## Cloudflare setup (email — being retired in Phase 3)
 
 Settings → **Variables and Secrets**:
 
@@ -56,6 +91,16 @@ If the PDF or the Resend call fails, the Worker returns a failure and the app ke
 ## Editing the food lists
 
 `index.html` is compiled. Edit `School Lunch Favorites.dc.html` in the design project — the lists live in one block at the top of the logic section (`static CATS` for the nine categories, `static EXTRAS` for dips), each item written as `{ n: 'Name', e: '🍎' }` — then re-export.
+
+## Roadmap
+
+Phase 2 (done): D1 schema + binding.
+Phase 3: the wizard saves completed profiles to D1; email code removed.
+Phases 4–6: Parent Portal dashboard, child profile view + PDF, Compare Profiles.
+Then stop — weekly planner, grocery engine and prep plan are a later project.
+
+Parent Portal auth will be **Cloudflare Access** on `/parent*` and `/api/parent/*`.
+No credentials in the repo or in client JavaScript, ever.
 
 ## Local testing
 
