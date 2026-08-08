@@ -30,9 +30,15 @@ export default {
 /* ------------------------------------------------------------------ submit */
 
 async function handleSubmit(request, env) {
+  // Cheap abuse guard: a real profile is a few KB at most.
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (declared > 64 * 1024) return json({ success: false, message: 'Submission too large.' }, 413);
+
   let data;
   try {
-    data = await request.json();
+    const raw = await request.text();
+    if (raw.length > 64 * 1024) return json({ success: false, message: 'Submission too large.' }, 413);
+    data = JSON.parse(raw);
   } catch {
     return json({ success: false, message: 'Invalid JSON body.' }, 400);
   }
