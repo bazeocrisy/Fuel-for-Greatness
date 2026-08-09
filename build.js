@@ -1,1 +1,1 @@
-window.FFG_BUILD = '2026.08.09-16';
+window.FFG_BUILD = '2026.08.09-18';

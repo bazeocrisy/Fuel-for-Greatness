@@ -14,7 +14,7 @@ schema.sql        D1 tables (apply once)
 seed.sql          children + food catalog (apply once, after schema)
 ```
 
-Current build: **2026.08.09-16**
+Current build: **2026.08.09-18**
 
 ## Deployment
 
@@ -43,10 +43,15 @@ GET  /parent                  → Cloudflare Access → Worker → parent.html
 assets are considered. That matters: a path *list* only covers the spellings it
 literally matches, and `//parent.html` matches none of them — the portal shell would
 have been served straight off static assets with no Worker involvement. The Worker
-normalizes the request path, 308-redirects any non-canonical parent spelling
-(`/parent.html`, `//parent.html`, `/Parent/`, `/parent/./x`) to `/parent` so the
-Access rule always evaluates it, and falls through to `env.ASSETS.fetch(request)` for
-ordinary files.
+normalizes the request path, redirects any non-canonical parent spelling
+(`/parent.html`, `//parent.html`, `/Parent/`, `/parent/./x`) **once** to `/parent`,
+and falls through to `env.ASSETS.fetch(request)` for ordinary files.
+
+`/parent` itself is always **served**, never redirected, and `assets.html_handling`
+is `"none"`. Both matter: the asset server's default behaviour answers a request for
+`/parent.html` with a redirect to `/parent`, which sent the browser back into the
+Worker and produced `ERR_TOO_MANY_REDIRECTS`. `serveParentShell()` also absorbs any
+3xx from the asset server internally, so a redirect can never reach the browser.
 
 There is no email in this application. No Resend, no API key, no `/api/submit`.
 Parents read profiles in the portal and print the PDF from there.

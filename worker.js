@@ -28,11 +28,19 @@ export default {
     /* Every parent-ish spelling collapses to the single canonical /parent, so a
        request can never slip past the Cloudflare Access rule on /parent* by
        arriving as //parent.html, /Parent.html, /parent/./x or %2F-escaped text.
-       'p' below is already collapsed + lower-cased by normalizePath().        */
+       'p' below is already collapsed + lower-cased by normalizePath().
+
+       REDIRECT-LOOP SAFETY. The canonical /parent is SERVED, never redirected:
+       the asset server rewrites .html paths to their extensionless form, so
+       answering /parent with anything 3xx pointed straight back at /parent and
+       the browser ping-ponged until it gave up (ERR_TOO_MANY_REDIRECTS). Only a
+       genuinely different spelling is redirected, and only ever once, to a
+       target that is always served rather than bounced again.                 */
     if (isParentPath(p)) {
-      // Not the canonical spelling? Bounce to it so Access evaluates /parent*.
-      if (url.pathname !== '/parent') return Response.redirect(new URL('/parent', url.origin).toString(), 308);
-      return env.ASSETS.fetch(new Request(new URL('/parent.html', url.origin), request));
+      if (url.pathname === '/parent') return serveParentShell(env, url);
+      // A different spelling: one hop to the canonical path so Access sees it.
+      // The target is /parent, which the branch above always serves.
+      return Response.redirect(new URL('/parent', url.origin).toString(), 302);
     }
 
     if (p.startsWith('/api/')) {
@@ -125,6 +133,36 @@ function crossOrigin(request, url) {
   try { host = new URL(origin).host; } catch (e) { host = '\u0000'; }
   if (host === url.host) return null;
   return json({ success: false, message: 'Request blocked: unexpected origin.' }, 403);
+}
+
+/* Returns the portal shell as a BODY, never as a redirect.
+
+   Cloudflare Static Assets applies html_handling to asset lookups: a request for
+   /parent.html is normally answered with a redirect to the extensionless
+   /parent. Passing that response through would send the browser back to /parent,
+   which lands here again — an endless cycle. wrangler.jsonc now sets
+   html_handling:"none", and this function additionally absorbs any 3xx the asset
+   server might still produce, following it internally so the browser only ever
+   receives HTML. Belt and braces: a redirect can never escape this function.  */
+async function serveParentShell(env, url) {
+  let target = new URL('/parent.html', url.origin);
+  for (let hop = 0; hop < 3; hop++) {
+    const res = await env.ASSETS.fetch(new Request(target.toString(), { method: 'GET' }));
+    if (res.status < 300 || res.status >= 400) {
+      // Copy out so we can guarantee no-store on the authenticated shell.
+      const out = new Response(res.body, res);
+      out.headers.set('cache-control', 'no-store');
+      return out;
+    }
+    const loc = res.headers.get('location');
+    if (!loc) break;
+    const next = new URL(loc, url.origin);
+    if (next.pathname === target.pathname) break;   // pointing at itself
+    target = next;
+  }
+  return new Response('The Parent Portal could not be loaded.', {
+    status: 500, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+  });
 }
 
 function accessEmail(request) {

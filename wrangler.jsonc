@@ -8,6 +8,12 @@
     // Serve the repo root as the static site, minus everything in .assetsignore
     "directory": "./",
     "binding": "ASSETS",
+    // Do NOT rewrite .html paths to their extensionless form. That rewrite is a
+    // REDIRECT, and because the Worker serves the portal by asking the asset
+    // server for /parent.html, that redirect pointed the browser back at
+    // /parent and produced ERR_TOO_MANY_REDIRECTS. With "none" the asset server
+    // returns the file itself and the Worker owns all parent routing.
+    "html_handling": "none",
     // TRUE, not a pattern list. A path list can only protect the spellings it
     // literally matches: "//parent.html" matches none of "/parent", "/parent/*",
     // "/parent.html", so Cloudflare would have served the portal shell straight
