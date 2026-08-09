@@ -108,8 +108,40 @@ Protected API, all GET, all JSON:
 | `/api/parent/children/:slug/profile` | the ACTIVE APPROVED profile by category |
 | `/api/parent/children/:slug/report.pdf` | the branded PDF, generated from the approved session snapshot |
 | `/api/parent/compare` | both-like / only-A / only-B, overall and per category |
+| `/api/parent/children/:slug/pending` | GET — the diff a waiting retake would apply (added / removed per category). Read-only |
+| `/api/parent/children/:slug/pending/approve` | POST — projects the pending snapshot into the active profile; the old approved session becomes `superseded` |
+| `/api/parent/children/:slug/pending/decline` | POST — marks the pending session `declined`; the approved profile is untouched |
+| `/api/parent/children/:slug/reset` | POST `{confirm:true}` — deletes this child's `child_food_preferences`, `child_category_responses` and ALL `profile_sessions`, and clears `children.active_session_id` |
 
-### Cloudflare Access setup (do this before sharing the URL)
+The reset keeps the child record (name, grade, theme, family link), the food catalog and
+every app setting. Afterwards the portal shows **No food profile yet** and the child's next
+wizard run is version 1 again, auto-approved. Reset is parent-only — there is no reset
+control anywhere on the child side. Children may edit during the wizard or submit a retake
+(`/?child=slug`), which always saves as a new pending version.
+
+### Parent authentication — REQUIRED before sharing the URL
+
+The portal fails **closed**: with no passcode set, `/api/parent/*` returns 503 and the
+portal shows a setup notice instead of any family data.
+
+1. Cloudflare dashboard → Workers & Pages → your Worker → **Settings → Variables and Secrets**.
+2. Add a **Secret** named `PARENT_PASSCODE` — the family passphrase. Long is better; 6 characters minimum.
+3. Add a second **Secret** named `PARENT_SIGNING_KEY` — any long random string (used to sign
+   sessions). Optional: without it the passcode signs its own sessions, which still works,
+   but a separate key means changing the passcode doesn't invalidate nothing else.
+4. Deploy. Visit `/parent` — you should get a sign-in card.
+
+How it works: the passcode is POSTed once to `/api/parent/login`, compared in constant
+time, and exchanged for an **HMAC-SHA256 signed, HttpOnly, Secure, SameSite=Strict**
+cookie lasting 30 days. The passcode never reaches browser JavaScript, and neither secret
+is ever in the repo. Every `/api/parent/*` read verifies the signature and expiry.
+`Sign out` clears the cookie. To revoke every device at once, change `PARENT_SIGNING_KEY`.
+
+### Cloudflare Access (optional upgrade — needs a custom domain)
+
+`*.workers.dev` hostnames cannot be protected by Access; it needs a domain on your
+account. If you add one later, the Worker **already honours Access identity headers** —
+turn Access on and no code changes at all.
 
 1. Cloudflare dashboard → **Zero Trust** → Access → Applications → **Add an application** → *Self-hosted*.
 2. Application name: `Fuel for Greatness — Parent Portal`.
@@ -118,10 +150,10 @@ Protected API, all GET, all JSON:
 4. Policy: **Allow**, Include → *Emails* → your two parent email addresses.
 5. Login methods: **One-time PIN** (and Google if you want it) — no passwords anywhere.
 6. Save. Visiting `/parent` now asks for an email PIN; the child wizard at `/` stays public.
-7. **Optional belt-and-braces:** add a Worker Variable `PARENT_GUARD` = `strict`. The Worker
-   then refuses any `/parent*` or `/api/parent/*` request that arrives without an Access
-   identity header — protection even if a policy is later removed by accident.
-   Leave it unset until Access is live, or you will lock yourself out.
+6. `wrangler.jsonc` routes `/parent*` through the Worker (`run_worker_first`), so a
+   direct hit on `/parent.html` is covered by the guard below too. Access is still the
+   real gate — the guard is a fallback, not a replacement.
+
 
 Nothing about parent auth lives in the repo, in `index.html`, or in client JavaScript.
 

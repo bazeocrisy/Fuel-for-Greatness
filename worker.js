@@ -7,7 +7,11 @@
  *   GET  /api/child/:slug/status   {saved, lastCompletedAt, pending} — no food data
  *
  * PARENT (Phase 4+, behind Cloudflare Access on /parent* and /api/parent/*)
- *   /api/parent/children, .../:slug/profile, .../:slug/report.pdf, /api/parent/compare
+ *   GET  /api/parent/children, .../:slug/profile, .../:slug/report.pdf, /api/parent/compare
+ *   GET  /api/parent/children/:slug/pending          diff of the waiting retake
+ *   POST /api/parent/children/:slug/pending/approve  promote it to the active profile
+ *   POST /api/parent/children/:slug/pending/decline   keep the approved profile
+ *   POST /api/parent/children/:slug/reset             erase this child's food profile
  *
  * Binding: DB (Cloudflare D1). Schema in schema.sql, reference data in seed.sql.
  * The browser never talks to D1 — only to these endpoints.
@@ -21,24 +25,37 @@ export default {
     const url = new URL(request.url);
     const p = url.pathname;
 
-    // Parent Portal pages (protected by Cloudflare Access on /parent*)
-    if (p === '/parent' || p === '/parent/' || p.startsWith('/parent/')) {
-      const guard = accessGuard(request, env);
-      if (guard) return guard;
+    // The portal shell is public; it renders a sign-in gate and every byte of
+    // family data behind it comes from the guarded /api/parent/* endpoints.
+    if (p === '/parent' || p === '/parent/' || p.startsWith('/parent/') || p === '/parent.html') {
       return env.ASSETS.fetch(new Request(new URL('/parent.html', url.origin), request));
     }
 
     if (p.startsWith('/api/')) {
       let m;
       if (p.startsWith('/api/parent/')) {
-        const guard = accessGuard(request, env);
+        // Auth endpoints are the only unguarded part of the parent namespace.
+        if (p === '/api/parent/login')  return request.method === 'POST' ? parentLogin(request, env) : json({ success: false, message: 'Method not allowed' }, 405);
+        if (p === '/api/parent/logout') return parentLogout();
+        if (p === '/api/parent/session') return parentSession(request, env);
+
+        const guard = await requireParent(request, env);
         if (guard) return guard;
-        if (request.method !== 'GET') return json({ success: false, message: 'Method not allowed' }, 405);
-        if (p === '/api/parent/children') return parentChildren(env);
-        if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/profile$/))) return parentProfile(env, m[1]);
-        if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/report\.pdf$/))) return parentReport(env, m[1]);
-        if (p === '/api/parent/compare') return parentCompare(env);
-        return json({ success: false, message: 'Not found' }, 404);
+        if (request.method === 'GET') {
+          if (p === '/api/parent/children') return parentChildren(env);
+          if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/profile$/))) return parentProfile(env, m[1]);
+          if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/pending$/))) return parentPending(env, m[1]);
+          if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/report\.pdf$/))) return parentReport(env, m[1]);
+          if (p === '/api/parent/compare') return parentCompare(env);
+          return json({ success: false, message: 'Not found' }, 404);
+        }
+        if (request.method === 'POST') {
+          if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/pending\/approve$/))) return parentApprove(env, m[1]);
+          if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/pending\/decline$/))) return parentDecline(env, m[1]);
+          if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/reset$/))) return parentReset(request, env, m[1]);
+          return json({ success: false, message: 'Not found' }, 404);
+        }
+        return json({ success: false, message: 'Method not allowed' }, 405);
       }
       if ((m = p.match(/^\/api\/child\/([a-z0-9-]+)\/profile$/))) {
         if (request.method !== 'POST') return json({ success: false, message: 'Method not allowed' }, 405);
@@ -56,18 +73,122 @@ export default {
 };
 
 /* ------------------------------------------------------------ parent access
-   Cloudflare Access enforces authentication at the edge on /parent* and
-   /api/parent/* — it runs before this Worker, so by the time a request arrives
-   it is already authenticated. This is a belt-and-braces check: set the
-   PARENT_GUARD variable to "strict" once Access is live and the Worker will
-   additionally refuse any request that arrives without an Access identity.   */
 
-function accessGuard(request, env) {
-  if (String(env.PARENT_GUARD || '').toLowerCase() !== 'strict') return null;
-  const email = request.headers.get('cf-access-authenticated-user-email');
-  const jwt = request.headers.get('cf-access-jwt-assertion');
-  if (email || jwt) return null;
-  return json({ success: false, message: 'Parent sign-in required.' }, 403);
+   Two accepted identities, checked in order:
+
+   1. Cloudflare Access — if a cf-access-* identity header is present the request
+      was already authenticated at the edge. Costs nothing to honour, so moving to
+      Access later (once a custom domain exists) needs no code change.
+   2. Passphrase session — PARENT_PASSCODE (a Cloudflare Secret) is exchanged once
+      for an HMAC-SHA256 signed, HttpOnly, Secure, SameSite=Strict cookie signed
+      with PARENT_SIGNING_KEY. The passcode never reaches browser JavaScript, and
+      neither value is ever in the repo.
+
+   Fails CLOSED: with no secrets configured, parent data is refused outright.   */
+
+const COOKIE = 'ffg_parent';
+const SESSION_DAYS = 30;
+
+const enc = new TextEncoder();
+const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function hmac(key, msg) {
+  const k = await crypto.subtle.importKey('raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return b64url(await crypto.subtle.sign('HMAC', k, enc.encode(msg)));
+}
+
+// Length-independent comparison — no early exit on the first differing byte.
+function safeEqual(a, b) {
+  const A = enc.encode(String(a)), B = enc.encode(String(b));
+  let diff = A.length ^ B.length;
+  const n = Math.max(A.length, B.length);
+  for (let i = 0; i < n; i++) diff |= (A[i] || 0) ^ (B[i] || 0);
+  return diff === 0;
+}
+
+function readCookie(request, name) {
+  const raw = request.headers.get('cookie') || '';
+  for (const part of raw.split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return decodeURIComponent(v.join('='));
+  }
+  return null;
+}
+
+function signingKey(env) {
+  // Falls back to the passcode so a single secret is enough to run securely.
+  return env.PARENT_SIGNING_KEY || env.PARENT_PASSCODE || '';
+}
+
+async function makeToken(env) {
+  const exp = Date.now() + SESSION_DAYS * 86400000;
+  const payload = b64url(enc.encode(JSON.stringify({ exp })));
+  return payload + '.' + (await hmac(signingKey(env), payload));
+}
+
+async function validToken(env, token) {
+  if (!token || token.indexOf('.') < 0) return false;
+  const [payload, sig] = token.split('.');
+  const expect = await hmac(signingKey(env), payload);
+  if (!safeEqual(sig, expect)) return false;
+  try {
+    const { exp } = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
+    return typeof exp === 'number' && Date.now() < exp;
+  } catch { return false; }
+}
+
+function parentConfigured(env) { return !!(env.PARENT_PASSCODE && String(env.PARENT_PASSCODE).length >= 6); }
+
+async function isParent(request, env) {
+  if (request.headers.get('cf-access-authenticated-user-email') || request.headers.get('cf-access-jwt-assertion')) return true;
+  if (!parentConfigured(env)) return false;
+  return validToken(env, readCookie(request, COOKIE));
+}
+
+async function requireParent(request, env) {
+  if (!parentConfigured(env)) {
+    return json({ success: false, code: 'not_configured', message: 'Parent access is not configured yet. Set the PARENT_PASSCODE secret in Cloudflare.' }, 503);
+  }
+  if (await isParent(request, env)) return null;
+  return json({ success: false, code: 'auth_required', message: 'Parent sign-in required.' }, 401);
+}
+
+async function parentLogin(request, env) {
+  if (!parentConfigured(env)) return json({ success: false, code: 'not_configured', message: 'Parent access is not configured yet. Set the PARENT_PASSCODE secret in Cloudflare.' }, 503);
+  let body;
+  try { body = await request.json(); } catch { return json({ success: false, message: 'Invalid request.' }, 400); }
+  const given = String((body && body.passcode) || '');
+  if (!given) return json({ success: false, message: 'Enter the family passcode.' }, 400);
+
+  // Constant delay on every attempt: no timing signal, and brute force is slow.
+  await new Promise((r) => setTimeout(r, 400));
+  if (!safeEqual(given, String(env.PARENT_PASSCODE))) {
+    return json({ success: false, message: 'That passcode is not right.' }, 401);
+  }
+  const token = await makeToken(env);
+  return new Response(JSON.stringify({ success: true, message: 'Signed in.' }), {
+    status: 200,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'set-cookie': COOKIE + '=' + encodeURIComponent(token) + '; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=' + SESSION_DAYS * 86400,
+    },
+  });
+}
+
+function parentLogout() {
+  return new Response(JSON.stringify({ success: true, message: 'Signed out.' }), {
+    status: 200,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'set-cookie': COOKIE + '=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0',
+    },
+  });
+}
+
+async function parentSession(request, env) {
+  return json({ success: true, configured: parentConfigured(env), authed: await isParent(request, env) });
 }
 
 /* --------------------------------------------------------- parent: reads */
@@ -185,13 +306,222 @@ async function parentReport(env, slug) {
   let payload;
   try { payload = JSON.parse(session.snapshot_json); } catch { return json({ success: false, message: 'Stored profile could not be read.' }, 500); }
   const report = normalize(payload, false);
-  const bytes = buildPdf(report);
+  // buildPdf() returns a LATIN-1 STRING whose xref offsets are code-unit counts.
+  // Response() would encode it as UTF-8 and shift every offset past the first
+  // non-ASCII character, producing a "damaged file". Convert 1 code unit -> 1 byte.
+  const pdf = buildPdf(report);
+  const bytes = new Uint8Array(pdf.length);
+  for (let i = 0; i < pdf.length; i++) bytes[i] = pdf.charCodeAt(i) & 0xff;
   return new Response(bytes, {
     headers: {
       'content-type': 'application/pdf',
       'content-disposition': 'inline; filename="' + pdfFilename(report) + '"',
       'cache-control': 'no-store',
     },
+  });
+}
+
+/* -------------------------------------------- shared: catalog + validation
+
+   One validator serves both the child's save and the parent's approval, so a
+   snapshot can never be projected into the active profile under looser rules
+   than the ones it was accepted with.                                        */
+
+async function loadCatalog(env) {
+  const cats = (await env.DB.prepare('SELECT id, slug, display_name, emoji, sort_order FROM food_categories ORDER BY sort_order').all()).results || [];
+  const items = (await env.DB.prepare('SELECT id, name, emoji, category_id FROM food_items WHERE active = 1').all()).results || [];
+  return { cats, items };
+}
+
+// -> { rows:[{categoryId, foodIds, foodNames, answered, noneSelected}], problems, missing }
+function rowsFromSnapshot(data, cats, items) {
+  const catByName = new Map(cats.map((c) => [c.display_name, c]));
+  const key = (categoryId, name) => categoryId + '|' + name;
+  const byKey = new Map(items.map((i) => [key(i.category_id, i.name), i]));
+  const answeredMap = data && data.answered && typeof data.answered === 'object' ? data.answered : {};
+  const selections = (data && data.selections) || {};
+  const rows = [], problems = [];
+
+  for (const [name, value] of Object.entries(selections)) {
+    const cat = catByName.get(name);
+    if (!cat) { problems.push('Unknown category: ' + name); continue; }
+    const picks = Array.isArray(value) ? value : [];
+    const foodIds = [], foodNames = [];
+    for (const foodName of picks) {
+      const item = byKey.get(key(cat.id, String(foodName)));
+      if (!item) { problems.push('Unknown food in ' + name + ': ' + foodName); continue; }
+      foodIds.push(item.id); foodNames.push(item.name);
+    }
+    const answered = answeredMap[name] === true || foodIds.length > 0;
+    rows.push({ categoryId: cat.id, categoryName: cat.display_name, foodIds, foodNames, answered, noneSelected: answered && foodIds.length === 0 });
+  }
+  const answeredIds = new Set(rows.filter((r) => r.answered).map((r) => r.categoryId));
+  const missing = cats.filter((c) => !answeredIds.has(c.id)).map((c) => c.display_name);
+  return { rows, problems, missing };
+}
+
+// Statements that replace the ACTIVE profile tables with `rows`. Used on the
+// child's first save and on a parent approval — nowhere else.
+function projectStatements(env, childId, rows) {
+  const out = [
+    env.DB.prepare('DELETE FROM child_food_preferences WHERE child_id = ?').bind(childId),
+    env.DB.prepare('DELETE FROM child_category_responses WHERE child_id = ?').bind(childId),
+  ];
+  for (const r of rows) {
+    out.push(env.DB.prepare('INSERT INTO child_category_responses (child_id, category_id, answered, none_selected) VALUES (?, ?, 1, ?)').bind(childId, r.categoryId, r.noneSelected ? 1 : 0));
+    for (const fid of r.foodIds) {
+      out.push(env.DB.prepare('INSERT OR REPLACE INTO child_food_preferences (child_id, food_item_id, liked) VALUES (?, ?, 1)').bind(childId, fid));
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------- parent: review a pending retake */
+
+async function childRow(env, slug) {
+  return env.DB.prepare('SELECT id, slug, full_name, first_name, grade, accent FROM children WHERE slug = ?').bind(slug).first();
+}
+function latestPending(env, childId) {
+  return env.DB.prepare(
+    "SELECT id, version, completed_at, total_selected, snapshot_json FROM profile_sessions WHERE child_id = ? AND status = 'pending' ORDER BY version DESC LIMIT 1"
+  ).bind(childId).first();
+}
+
+// GET: what would change if this update were approved. Read-only.
+async function parentPending(env, slug) {
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const child = await childRow(env, slug);
+  if (!child) return json({ success: false, message: 'Unknown child.' }, 404);
+  const pending = await latestPending(env, child.id);
+  if (!pending) return json({ success: false, code: 'no_pending', message: 'No update is waiting for review.' }, 404);
+
+  let snap;
+  try { snap = JSON.parse(pending.snapshot_json); } catch { return json({ success: false, message: 'The submitted update could not be read.' }, 500); }
+  const { cats, items } = await loadCatalog(env);
+  const { rows, problems } = rowsFromSnapshot(snap, cats, items);
+  const rowByCat = new Map(rows.map((r) => [r.categoryId, r]));
+
+  const approvedPrefs = (await env.DB.prepare(
+    'SELECT f.name, f.category_id FROM child_food_preferences p JOIN food_items f ON f.id = p.food_item_id WHERE p.child_id = ?'
+  ).bind(child.id).all()).results || [];
+  const approvedResp = (await env.DB.prepare('SELECT category_id, none_selected FROM child_category_responses WHERE child_id = ?').bind(child.id).all()).results || [];
+  const noneBy = new Map(approvedResp.map((r) => [r.category_id, !!r.none_selected]));
+  const approvedSession = await env.DB.prepare(
+    "SELECT version, completed_at, total_selected FROM profile_sessions WHERE child_id = ? AND status = 'approved' ORDER BY version DESC LIMIT 1"
+  ).bind(child.id).first();
+
+  let added = 0, removed = 0;
+  const categories = cats.map((c) => {
+    const now = new Set(approvedPrefs.filter((p) => p.category_id === c.id).map((p) => p.name));
+    const next = new Set((rowByCat.get(c.id) || { foodNames: [] }).foodNames);
+    const a = [...next].filter((n) => !now.has(n)).sort();
+    const r = [...now].filter((n) => !next.has(n)).sort();
+    added += a.length; removed += r.length;
+    return {
+      slug: c.slug, name: c.display_name, emoji: c.emoji,
+      added: a, removed: r, kept: [...next].filter((n) => now.has(n)).sort(),
+      approvedCount: now.size, pendingCount: next.size,
+      approvedNone: !!noneBy.get(c.id), pendingNone: !!(rowByCat.get(c.id) || {}).noneSelected,
+    };
+  });
+
+  return json({
+    success: true,
+    child: { slug: child.slug, fullName: child.full_name, firstName: child.first_name, grade: child.grade, accent: child.accent },
+    approved: approvedSession ? { version: approvedSession.version, completedAt: approvedSession.completed_at, totalSelected: approvedSession.total_selected } : null,
+    pending: { version: pending.version, completedAt: pending.completed_at, totalSelected: pending.total_selected },
+    changes: { added, removed, unchanged: added === 0 && removed === 0 },
+    problems: problems.slice(0, 10),
+    categories,
+  });
+}
+
+// POST: promote the pending snapshot into the active profile tables.
+async function parentApprove(env, slug) {
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const child = await childRow(env, slug);
+  if (!child) return json({ success: false, message: 'Unknown child.' }, 404);
+  const pending = await latestPending(env, child.id);
+  if (!pending) return json({ success: false, code: 'no_pending', message: 'No update is waiting for review.' }, 404);
+
+  let snap;
+  try { snap = JSON.parse(pending.snapshot_json); } catch { return json({ success: false, message: 'The submitted update could not be read.' }, 500); }
+  const { cats, items } = await loadCatalog(env);
+  if (!cats.length || !items.length) return json({ success: false, message: 'Reference data missing — apply seed.sql.' }, 503);
+  const { rows, missing } = rowsFromSnapshot(snap, cats, items);
+  if (missing.length) return json({ success: false, message: 'That update is missing answers and cannot be approved.', missing }, 400);
+
+  const batch = [
+    env.DB.prepare("UPDATE profile_sessions SET status = 'superseded', reviewed_at = datetime('now') WHERE child_id = ? AND status = 'approved'").bind(child.id),
+    env.DB.prepare("UPDATE profile_sessions SET status = 'approved', reviewed_at = datetime('now') WHERE id = ?").bind(pending.id),
+    ...projectStatements(env, child.id, rows),
+    env.DB.prepare("UPDATE children SET active_session_id = ?, updated_at = datetime('now') WHERE id = ?").bind(pending.id, child.id),
+  ];
+  try { await env.DB.batch(batch); }
+  catch (err) { return json({ success: false, message: 'Could not approve the update.', detail: String(err).slice(0, 300) }, 500); }
+
+  return json({ success: true, status: 'approved', version: pending.version, totalSelected: rows.reduce((a, r) => a + r.foodIds.length, 0), message: 'Update approved — it is now the active profile.' });
+}
+
+// POST: reject it. The approved profile and its tables are not touched at all.
+async function parentDecline(env, slug) {
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const child = await childRow(env, slug);
+  if (!child) return json({ success: false, message: 'Unknown child.' }, 404);
+  const pending = await latestPending(env, child.id);
+  if (!pending) return json({ success: false, code: 'no_pending', message: 'No update is waiting for review.' }, 404);
+  try {
+    await env.DB.prepare("UPDATE profile_sessions SET status = 'declined', reviewed_at = datetime('now') WHERE id = ?").bind(pending.id).run();
+  } catch (err) {
+    return json({ success: false, message: 'Could not decline the update.', detail: String(err).slice(0, 300) }, 500);
+  }
+  return json({ success: true, status: 'declined', version: pending.version, message: 'Update declined. The current approved profile stays active.' });
+}
+
+/* --------------------------------------------------- parent: reset a profile
+
+   Destructive and parent-only. Clears this child's food answers and their whole
+   submission history, then returns the child to "No food profile yet". The child
+   record (name, grade, theme, family link), the food catalog, and every app
+   setting are untouched — nothing outside these three statements is written.  */
+
+async function parentReset(request, env, slug) {
+  if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
+  const child = await childRow(env, slug);
+  if (!child) return json({ success: false, message: 'Unknown child.' }, 404);
+
+  // The portal asks the parent to confirm; the API insists on hearing it too.
+  let body = null;
+  try { body = await request.json(); } catch { body = null; }
+  if (!body || body.confirm !== true) {
+    return json({ success: false, code: 'confirm_required', message: 'Reset requires an explicit confirmation.' }, 400);
+  }
+
+  const before = await env.DB.prepare(
+    'SELECT (SELECT COUNT(*) FROM child_food_preferences WHERE child_id = ?1) AS prefs, (SELECT COUNT(*) FROM child_category_responses WHERE child_id = ?1) AS responses, (SELECT COUNT(*) FROM profile_sessions WHERE child_id = ?1) AS sessions'
+  ).bind(child.id).first();
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM child_food_preferences WHERE child_id = ?').bind(child.id),
+      env.DB.prepare('DELETE FROM child_category_responses WHERE child_id = ?').bind(child.id),
+      env.DB.prepare('DELETE FROM profile_sessions WHERE child_id = ?').bind(child.id),
+      env.DB.prepare("UPDATE children SET active_session_id = NULL, updated_at = datetime('now') WHERE id = ?").bind(child.id),
+    ]);
+  } catch (err) {
+    return json({ success: false, message: 'Could not reset the profile.', detail: String(err).slice(0, 300) }, 500);
+  }
+
+  return json({
+    success: true,
+    reset: true,
+    child: { slug: child.slug, firstName: child.first_name },
+    deleted: {
+      foodPreferences: Number((before && before.prefs) || 0),
+      categoryResponses: Number((before && before.responses) || 0),
+      sessions: Number((before && before.sessions) || 0),
+    },
+    message: child.first_name + "'s food profile was reset. They can take the wizard again from scratch.",
   });
 }
 
@@ -226,36 +556,12 @@ async function saveChildProfile(request, env, slug) {
   if (!child) return json({ success: false, message: 'That child is not set up in the database yet.' }, 404);
 
   // ---- validate every category and every food name against D1 ----
-  const cats = (await env.DB.prepare('SELECT id, slug, display_name FROM food_categories ORDER BY sort_order').all()).results || [];
-  const items = (await env.DB.prepare('SELECT f.id, f.name, f.category_id FROM food_items f WHERE f.active = 1').all()).results || [];
+  const { cats, items } = await loadCatalog(env);
   if (!cats.length || !items.length) return json({ success: false, message: 'Reference data missing — apply seed.sql.' }, 503);
 
-  const catByName = new Map(cats.map((c) => [c.display_name, c]));
-  const itemKey = (categoryId, name) => categoryId + '|' + name;
-  const itemIdByKey = new Map(items.map((i) => [itemKey(i.category_id, i.name), i.id]));
-
-  const answeredMap = data.answered && typeof data.answered === 'object' ? data.answered : {};
-  const rows = [];       // {categoryId, foodIds[], noneSelected}
-  const problems = [];
-
-  for (const [name, value] of Object.entries(data.selections)) {
-    const cat = catByName.get(name);
-    if (!cat) { problems.push('Unknown category: ' + name); continue; }
-    const picks = Array.isArray(value) ? value : [];
-    const foodIds = [];
-    for (const foodName of picks) {
-      const id = itemIdByKey.get(itemKey(cat.id, String(foodName)));
-      if (!id) { problems.push('Unknown food in ' + name + ': ' + foodName); continue; }
-      foodIds.push(id);
-    }
-    const answered = answeredMap[name] === true || foodIds.length > 0;
-    rows.push({ categoryId: cat.id, foodIds, answered, noneSelected: answered && foodIds.length === 0 });
-  }
+  const { rows, problems, missing } = rowsFromSnapshot(data, cats, items);
   if (problems.length) return json({ success: false, message: 'Submission rejected.', problems: problems.slice(0, 10) }, 400);
-
   // Every category must carry an intentional answer — same rule the wizard enforces.
-  const answeredIds = new Set(rows.filter((r) => r.answered).map((r) => r.categoryId));
-  const missing = cats.filter((c) => !answeredIds.has(c.id)).map((c) => c.display_name);
   if (missing.length) return json({ success: false, message: 'Some categories were not answered.', missing }, 400);
 
   // ---- versioning: first ever profile auto-approves, later retakes go pending ----
@@ -280,16 +586,7 @@ async function saveChildProfile(request, env, slug) {
   );
 
   // The preference tables ARE the approved profile — written only on approval.
-  if (status === 'approved') {
-    batch.push(env.DB.prepare('DELETE FROM child_food_preferences WHERE child_id = ?').bind(child.id));
-    batch.push(env.DB.prepare('DELETE FROM child_category_responses WHERE child_id = ?').bind(child.id));
-    for (const r of rows) {
-      batch.push(env.DB.prepare('INSERT INTO child_category_responses (child_id, category_id, answered, none_selected) VALUES (?, ?, 1, ?)').bind(child.id, r.categoryId, r.noneSelected ? 1 : 0));
-      for (const fid of r.foodIds) {
-        batch.push(env.DB.prepare('INSERT OR REPLACE INTO child_food_preferences (child_id, food_item_id, liked) VALUES (?, ?, 1)').bind(child.id, fid));
-      }
-    }
-  }
+  if (status === 'approved') batch.push(...projectStatements(env, child.id, rows));
 
   try {
     await env.DB.batch(batch);
