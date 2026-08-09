@@ -23,11 +23,15 @@ const MAX_BODY = 64 * 1024;
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const p = url.pathname;
+    const p = normalizePath(url.pathname);
 
-    // The portal shell is public; it renders a sign-in gate and every byte of
-    // family data behind it comes from the guarded /api/parent/* endpoints.
-    if (p === '/parent' || p === '/parent/' || p.startsWith('/parent/') || p === '/parent.html') {
+    /* Every parent-ish spelling collapses to the single canonical /parent, so a
+       request can never slip past the Cloudflare Access rule on /parent* by
+       arriving as //parent.html, /Parent.html, /parent/./x or %2F-escaped text.
+       'p' below is already collapsed + lower-cased by normalizePath().        */
+    if (isParentPath(p)) {
+      // Not the canonical spelling? Bounce to it so Access evaluates /parent*.
+      if (url.pathname !== '/parent') return Response.redirect(new URL('/parent', url.origin).toString(), 308);
       return env.ASSETS.fetch(new Request(new URL('/parent.html', url.origin), request));
     }
 
@@ -49,6 +53,9 @@ export default {
           return json({ success: false, message: 'Not found' }, 404);
         }
         if (request.method === 'POST') {
+          // Destructive routes additionally require a same-origin request.
+          const bad = crossOrigin(request, url);
+          if (bad) return bad;
           if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/pending\/approve$/))) return parentApprove(env, m[1]);
           if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/pending\/decline$/))) return parentDecline(env, m[1]);
           if ((m = p.match(/^\/api\/parent\/children\/([a-z0-9-]+)\/reset$/))) return parentReset(request, env, m[1]);
@@ -84,6 +91,42 @@ export default {
    Fails CLOSED: a request with no Access identity gets 401 and no family data.
    The public child wizard and /api/child/* never reach this code.            */
 
+/* Collapses a URL path to one comparable form: repeated slashes merged, any
+   %2F-escaped separators decoded, '.'/'..' segments resolved, trailing slash
+   dropped, lower-cased. Used for ROUTING decisions only — never to build a
+   response URL.                                                              */
+function normalizePath(pathname) {
+  let s = pathname || '/';
+  try { s = decodeURIComponent(s); } catch (e) { /* keep the raw form */ }
+  s = s.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  const out = [];
+  for (const seg of s.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') { out.pop(); continue; }
+    out.push(seg);
+  }
+  s = '/' + out.join('/');
+  if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
+  return s.toLowerCase();
+}
+
+// True for every spelling of the parent portal shell.
+function isParentPath(p) {
+  return p === '/parent' || p === '/parent.html' || p.startsWith('/parent/');
+}
+
+/* Access already proves WHO is calling; this proves the call came from our own
+   page rather than another site riding the Access cookie. Applied to the
+   destructive POSTs only. */
+function crossOrigin(request, url) {
+  const origin = request.headers.get('origin');
+  if (!origin) return null;               // same-origin fetches may omit it
+  let host = '';
+  try { host = new URL(origin).host; } catch (e) { host = '\u0000'; }
+  if (host === url.host) return null;
+  return json({ success: false, message: 'Request blocked: unexpected origin.' }, 403);
+}
+
 function accessEmail(request) {
   return request.headers.get('cf-access-authenticated-user-email') || '';
 }
@@ -105,6 +148,26 @@ async function requireParent(request) {
 // left to configure in the app; Access is configured in Cloudflare.
 function parentSession(request) {
   return json({ success: true, configured: true, authed: isParent(request), email: accessEmail(request) || null });
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
+function noProfilePage(child) {
+  const name = esc(child && child.first_name ? child.first_name : 'This child');
+  const body = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>No food profile yet</title></head>'
+    + '<body style="margin:0;background:#F7F9FB;color:#12161C;font-family:ui-sans-serif,system-ui,-apple-system,\'Segoe UI\',sans-serif">'
+    + '<div style="max-width:520px;margin:56px auto;padding:28px;background:#fff;border:1px solid #DDE3EA;border-top:6px solid #12161C;border-radius:20px">'
+    + '<div style="font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#6B7480">Fuel for Greatness</div>'
+    + '<h1 style="margin:8px 0 10px;font-size:24px;font-weight:900;letter-spacing:-.02em">No food profile yet</h1>'
+    + '<p style="margin:0 0 18px;font-size:16px;line-height:1.55;color:#3B434D">There is nothing to print for ' + name
+    + ' right now. Once they finish the food wizard and the profile is approved, the report will be available here.</p>'
+    + '<a href="/parent" style="display:inline-flex;align-items:center;min-height:44px;padding:14px 18px;border-radius:12px;background:#12161C;color:#fff;font-size:14px;font-weight:900;letter-spacing:.02em;text-decoration:none">BACK TO PARENT PORTAL</a>'
+    + '</div></body></html>';
+  return new Response(body, { status: 404, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
 }
 
 /* --------------------------------------------------------- parent: reads */
@@ -533,12 +596,13 @@ async function childStatus(env, slug) {
   if (!ALLOWED_CHILDREN.includes(slug)) return json({ success: false, message: 'Unknown child.' }, 404);
   if (!env.DB) return json({ success: false, message: 'The family database is not connected yet.' }, 503);
   const child = await env.DB.prepare('SELECT id FROM children WHERE slug = ?').bind(slug).first();
-  if (!child) return json({ success: true, saved: false, pending: false, lastCompletedAt: null });
+  if (!child) return json({ success: true, exists: false, saved: false, pending: false, lastCompletedAt: null });
   const row = await env.DB.prepare(
     "SELECT MAX(CASE WHEN status = 'approved' THEN completed_at END) AS approvedAt, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pendingCount FROM profile_sessions WHERE child_id = ?"
   ).bind(child.id).first();
   return json({
     success: true,
+    exists: true,
     saved: !!(row && row.approvedAt),
     lastCompletedAt: (row && row.approvedAt) || null,
     pending: Number((row && row.pendingCount) || 0) > 0,

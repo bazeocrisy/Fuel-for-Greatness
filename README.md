@@ -1,175 +1,139 @@
-# Fuel for Greatness — School Lunch Food Favorites
+# Fuel for Greatness
 
-Mobile wizard where Gabriella and Christopher pick the parent-approved foods they actually like. Deployed as a **Cloudflare Worker with static assets**.
+A school-lunch food-favorites app for the Bazemore family. Two children complete a
+guided wizard about what they like to eat; their parents review and approve the
+results in a private portal.
 
 ```
 index.html        the child wizard (self-contained, no build step)
-parent.html       the Parent Portal (served at /parent, behind Cloudflare Access)
-worker.js         the backend: serves the site + handles POST /api/submit
-wrangler.jsonc    Worker name, entry point, assets + D1 bindings, /api/* routing
-                  NOT included in delivery zips after Phase 2 — it holds your real
-                  D1 database_id. Never overwrite it from a download.
-schema.sql        Cloudflare D1 schema (Phase 2 — apply once)
-seed.sql          D1 reference data: family, children, categories, 201 foods
-ARCHITECTURE.md   the Parent Portal + D1 plan and phase order
-.assetsignore     keeps .git, backend and SQL files off the public site
-.gitignore
-README.md
+parent.html       the Parent Portal, served at /parent (Cloudflare Access)
+build.js          the single build stamp both pages display
+worker.js         the backend: routing, validation, D1 reads/writes, PDF
+wrangler.jsonc    Worker name, entry point, assets + D1 binding, /api/* routing
+schema.sql        D1 tables (apply once)
+seed.sql          children + food catalog (apply once, after schema)
+```
+
+Current build: **2026.08.09-16**
+
+## Deployment
+
+GitHub `main` is the deployment path. Push to `main` and Cloudflare builds and
+deploys the Worker. `wrangler.jsonc` is tracked in the repo because the build needs
+the D1 binding; it holds a database id, not a secret.
+
+```powershell
+cd C:\Fuel-for-Greatness
+git add -A
+git commit -m "..."
+git push
 ```
 
 ## Architecture
 
 ```
-browser → POST /api/submit → Worker (validates, builds HTML email + PDF) → Resend → parents
-GET /   → Worker → env.ASSETS.fetch() → index.html
+GET  /                        → Worker → env.ASSETS.fetch() → index.html      (public)
+POST /api/child/:slug/profile → Worker → validate → D1                        (public)
+GET  /api/child/:slug/status  → Worker → D1 (has-profile flags only)          (public)
+GET  /parent                  → Cloudflare Access → Worker → parent.html
+*    /api/parent/*            → Cloudflare Access → Worker → D1
 ```
 
-`run_worker_first: ["/api/*"]` makes the Worker execute before static-asset lookup, so `/api/submit` is genuinely server-side. The browser never talks to Resend and never sees a key.
+`run_worker_first` is `true`, so **every** request enters the Worker before static
+assets are considered. That matters: a path *list* only covers the spellings it
+literally matches, and `//parent.html` matches none of them — the portal shell would
+have been served straight off static assets with no Worker involvement. The Worker
+normalizes the request path, 308-redirects any non-canonical parent spelling
+(`/parent.html`, `//parent.html`, `/Parent/`, `/parent/./x`) to `/parent` so the
+Access rule always evaluates it, and falls through to `env.ASSETS.fetch(request)` for
+ordinary files.
 
-## Cloudflare D1 (Phase 2 — new)
+There is no email in this application. No Resend, no API key, no `/api/submit`.
+Parents read profiles in the portal and print the PDF from there.
 
-The family database. **Phase 2 adds the schema and the binding only** — no application
-code reads or writes D1 yet, so this deploys safely alongside the working email flow.
-See `ARCHITECTURE.md` for the full plan and phase order.
-
-One-time setup:
-
-1. **Create the database** — dashboard → Storage & Databases → D1 → Create, name it
-   `fuel-for-greatness`. Or from PowerShell:
-   ```powershell
-   npx wrangler d1 create fuel-for-greatness
-   ```
-2. **Paste the returned id** into `wrangler.jsonc`, replacing `PASTE_DATABASE_ID_HERE`.
-   Commit and push.
-3. **Apply the schema and seed data** (once, and again only if the schema changes):
-   ```powershell
-   npx wrangler d1 execute fuel-for-greatness --remote --file=./schema.sql
-   npx wrangler d1 execute fuel-for-greatness --remote --file=./seed.sql
-   ```
-4. **Verify:**
-   ```powershell
-   npx wrangler d1 execute fuel-for-greatness --remote --command "SELECT (SELECT COUNT(*) FROM children) AS children, (SELECT COUNT(*) FROM food_categories) AS categories, (SELECT COUNT(*) FROM food_items) AS foods;"
-   ```
-   Expect `2 / 10 / 201`.
-
-Both SQL files are re-runnable — every statement is `CREATE TABLE IF NOT EXISTS` or
-`INSERT OR IGNORE`, so re-applying never duplicates or destroys data.
-
-`seed.sql` is generated from the wizard's own `CATS`/`EXTRAS`/`KIDS` lists. If you add
-a food to the wizard, regenerate it rather than hand-editing, so the two cannot drift.
-
-## Cloudflare setup (email — being retired in Phase 3)
-
-Settings → **Variables and Secrets**:
-
-| Name | Type | Value |
-|---|---|---|
-| `RESEND_API_KEY` | Secret | your Resend API key |
-| `FROM_EMAIL` | Variable | a verified sender on a domain you control, e.g. `lunch@yourdomain.com` |
-| `TO_EMAILS` | Variable | `bazeocrisy@yahoo.com,stepflem30@gmail.com` |
-
-Until all three exist, `/api/submit` returns `503 {"success":false,"configured":false}` and the app shows its "We couldn't send it yet" screen — selections stay saved either way. Nothing ever fakes success in the browser.
-
-`FROM_EMAIL` must be on a domain verified in Resend. Yahoo/Gmail addresses cannot be used as the sender.
-
-## What the parents receive
-
-One email addressed to both parents containing:
-
-- A branded HTML summary (counts per category, then every selection, category colors, child accent color)
-- A designed PDF attachment: cover page with the child's name/grade/date and the FOOD → FUEL → FOCUS → PERFORMANCE line, a category summary, then two-column detail pages with colored category headers, page numbers and a footer
-
-Test-mode submissions are prefixed `[TEST]`, carry a TEST SUBMISSION banner in the email, a TEST MODE / NOT A FINAL CHILD PROFILE block on the PDF cover, and a `TEST_` filename prefix.
-
-Categories the child answered with "None of these for me" print as **None of these** — never as missing data.
-
-**PDF generation:** written directly in PDF syntax inside `worker.js` using the base-14 Helvetica fonts. No headless browser, no npm dependency, no external service, no added cost. Layout is a purpose-built parent report, not a screenshot of the app.
-
-If the PDF or the Resend call fails, the Worker returns a failure and the app keeps every selection in localStorage.
-
-## Data storage (client)
-
-`localStorage`, key `lunchFavorites.v1`, one record per profile (`gabriella`, `christopher`, `parentTest`). Autosaves on every tap; never cleared by submitting or by a failed send. Only the parent "Start over" / "Clear this profile" / "Reset test data" buttons erase a record.
-
-## Editing the food lists
-
-`index.html` is compiled. Edit `School Lunch Favorites.dc.html` in the design project — the lists live in one block at the top of the logic section (`static CATS` for the nine categories, `static EXTRAS` for dips), each item written as `{ n: 'Name', e: '🍎' }` — then re-export.
-
-## Parent Portal (Phase 4)
-
-Served at **/parent** (the Worker rewrites `/parent*` to `parent.html`). Hash routes:
-`#` dashboard, `#child/<slug>` profile, `#compare`.
-
-Protected API, all GET, all JSON:
-
-| Path | Returns |
-|---|---|
-| `/api/parent/children` | both children: status, version, last updated, favorites count, categories answered, pending update |
-| `/api/parent/children/:slug/profile` | the ACTIVE APPROVED profile by category |
-| `/api/parent/children/:slug/report.pdf` | the branded PDF, generated from the approved session snapshot |
-| `/api/parent/compare` | both-like / only-A / only-B, overall and per category |
-| `/api/parent/children/:slug/pending` | GET — the diff a waiting retake would apply (added / removed per category). Read-only |
-| `/api/parent/children/:slug/pending/approve` | POST — projects the pending snapshot into the active profile; the old approved session becomes `superseded` |
-| `/api/parent/children/:slug/pending/decline` | POST — marks the pending session `declined`; the approved profile is untouched |
-| `/api/parent/children/:slug/reset` | POST `{confirm:true}` — deletes this child's `child_food_preferences`, `child_category_responses` and ALL `profile_sessions`, and clears `children.active_session_id` |
-
-The reset keeps the child record (name, grade, theme, family link), the food catalog and
-every app setting. Afterwards the portal shows **No food profile yet** and the child's next
-wizard run is version 1 again, auto-approved. Reset is parent-only — there is no reset
-control anywhere on the child side. Children may edit during the wizard or submit a retake
-(`/?child=slug`), which always saves as a new pending version.
-
-### Parent authentication — Cloudflare Access (the only mechanism)
-
-Sign-in is handled entirely by **Cloudflare Access**, outside the application:
+## Parent authentication — Cloudflare Access only
 
 - Application paths: `/parent*` and `/api/parent/*` on the Worker domain.
 - Policy: **Allow**, Include → *Emails* → the two parent addresses.
 - Login method: **One-time PIN**.
 
 The Worker reads only the Access identity header
-(`cf-access-authenticated-user-email`, or `cf-access-jwt-assertion`) and fails **closed**:
-a request without one gets `401` and no family data. There is no app password —
-`PARENT_PASSCODE` and `PARENT_SIGNING_KEY` are not read by any code and can be deleted
-from the Worker's secrets. `Sign out` links to `/cdn-cgi/access/logout`.
+(`cf-access-authenticated-user-email`, or `cf-access-jwt-assertion`) and fails
+**closed**: no identity means `401` and no family data. There is no application
+password. `PARENT_PASSCODE`, `PARENT_SIGNING_KEY` and the old `ffg_parent` cookie
+are gone from the code and can be deleted from the Worker's secrets. Sign out links
+to `/cdn-cgi/access/logout`.
 
-The public child wizard and `/api/child/*` are outside the Access paths and stay public.
+Destructive parent POSTs (reset, approve, decline) additionally require a
+same-origin `Origin` header.
 
-### Cloudflare Access (optional upgrade — needs a custom domain)
+## Profile lifecycle
 
-`*.workers.dev` hostnames cannot be protected by Access; it needs a domain on your
-account. If you add one later, the Worker **already honours Access identity headers** —
-turn Access on and no code changes at all.
+| Event | Result |
+|---|---|
+| First completed wizard | session v1 `approved`; preference tables populated; `children.active_session_id` set |
+| Retake while a profile exists | new session `pending`; approved data untouched |
+| Parent APPROVE UPDATE | snapshot revalidated; old approved → `superseded`; pending → `approved`; tables replaced; `active_session_id` repointed |
+| Parent DECLINE UPDATE | pending → `declined`; approved data untouched |
+| Parent RESET FOOD PROFILE | that child's preferences, category responses and **all** sessions deleted; `active_session_id` NULL |
 
-1. Cloudflare dashboard → **Zero Trust** → Access → Applications → **Add an application** → *Self-hosted*.
-2. Application name: `Fuel for Greatness — Parent Portal`.
-3. Add two paths on your Worker domain (`fuel-for-greatness.bazeocrisy.workers.dev`):
-   `/parent*` and `/api/parent/*`.
-4. Policy: **Allow**, Include → *Emails* → your two parent email addresses.
-5. Login methods: **One-time PIN** (and Google if you want it) — no passwords anywhere.
-6. Save. Visiting `/parent` now asks for an email PIN; the child wizard at `/` stays public.
-6. `wrangler.jsonc` routes `/parent*` through the Worker (`run_worker_first`), so a
-   direct hit on `/parent.html` is covered by the guard below too. Access is still the
-   real gate — the guard is a fallback, not a replacement.
+Reset keeps the child row, name, grade, theme, family link, the food catalog and all
+app configuration, and never touches the other child. It requires both a confirmation
+modal and `{confirm:true}` on the API. Reset is parent-only — the child app has no
+reset control anywhere.
 
+After a reset, the child's device reconciles on next load: a **completed** local draft
+whose server profile no longer exists is discarded so the old picks cannot be
+re-submitted. An in-progress first-time draft is never discarded, and if the status
+check fails the local data is preserved untouched.
 
-Nothing about parent auth lives in the repo, in `index.html`, or in client JavaScript.
+## API
 
-## Roadmap
+### Public
+| Route | Purpose |
+|---|---|
+| `POST /api/child/:slug/profile` | save a completed wizard (64 KB cap, slug allow-list, categories and food names validated against D1, server-computed totals, test mode discarded before any D1 access) |
+| `GET /api/child/:slug/status` | `{exists, saved, pending, lastCompletedAt}` — no food data |
 
-Phase 2 (done): D1 schema + binding.
-Phase 3 (done): the wizard saves completed profiles to D1; email code removed.
-Phase 4 (done): Parent Portal — dashboard, child profile view + PDF, Compare Profiles,
-Access-protected routes.
-Next, on approval: review-and-approve for pending profile updates.
-Then stop — weekly planner, grocery engine and prep plan are a later project.
+### Cloudflare Access required
+| Route | Purpose |
+|---|---|
+| `GET /api/parent/session` | identity probe |
+| `GET /api/parent/children` | both children: status, version, last updated, counts, pending info |
+| `GET /api/parent/children/:slug/profile` | the approved profile |
+| `GET /api/parent/children/:slug/pending` | read-only diff of a waiting retake |
+| `GET /api/parent/children/:slug/report.pdf` | PDF of the **active approved** profile; a child with none gets a friendly HTML page, never raw JSON |
+| `GET /api/parent/compare` | both-like / only-A / only-B, overall and per category (approved data only) |
+| `POST /api/parent/children/:slug/pending/approve` | promote the pending snapshot |
+| `POST /api/parent/children/:slug/pending/decline` | mark it declined |
+| `POST /api/parent/children/:slug/reset` | `{confirm:true}` — erase this child's food profile |
 
-Parent Portal auth will be **Cloudflare Access** on `/parent*` and `/api/parent/*`.
-No credentials in the repo or in client JavaScript, ever.
+## Database
 
-## Local testing
+D1, binding name `DB`. Apply once:
 
+```powershell
+npx wrangler d1 execute fuel-for-greatness --remote --file=schema.sql
+npx wrangler d1 execute fuel-for-greatness --remote --file=seed.sql
 ```
-npx wrangler dev
-```
-Put secrets in a local `.dev.vars` file (git-ignored).
+
+`seed.sql` is generated from the wizard's `Component.CATS` / `Component.EXTRAS`. If you
+add a food, regenerate it rather than hand-editing, so the two cannot drift.
+
+## Data storage (client)
+
+The wizard autosaves to `localStorage` under `lunchFavorites.v1`, keyed per child,
+with Test Mode isolated under its own key. Test Mode never writes to D1: the Worker
+returns before any database access, so it creates no session and cannot change an
+approved profile.
+
+## PDF
+
+Written directly in PDF syntax in `worker.js` using the base-14 Helvetica fonts — no
+headless browser, no npm dependency, no external service. It always renders the active
+approved session; a pending or declined submission never appears.
+
+## Build stamp
+
+`build.js` sets `window.FFG_BUILD`, and both pages display it. Bump it there and
+nowhere else — the child and parent footers cannot drift apart.
