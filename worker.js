@@ -6,7 +6,7 @@
  *   POST /api/child/:slug/profile  save a completed food profile to D1
  *   GET  /api/child/:slug/status   {saved, lastCompletedAt, pending} — no food data
  *
- * PARENT (Phase 4+, behind Cloudflare Access on /parent* and /api/parent/*)
+ * PARENT (authenticated ONLY by Cloudflare Access on /parent* and /api/parent/*)
  *   GET  /api/parent/children, .../:slug/profile, .../:slug/report.pdf, /api/parent/compare
  *   GET  /api/parent/children/:slug/pending          diff of the waiting retake
  *   POST /api/parent/children/:slug/pending/approve  promote it to the active profile
@@ -34,12 +34,11 @@ export default {
     if (p.startsWith('/api/')) {
       let m;
       if (p.startsWith('/api/parent/')) {
-        // Auth endpoints are the only unguarded part of the parent namespace.
-        if (p === '/api/parent/login')  return request.method === 'POST' ? parentLogin(request, env) : json({ success: false, message: 'Method not allowed' }, 405);
-        if (p === '/api/parent/logout') return parentLogout();
+        // Identity probe only — it reports whether Cloudflare Access let this
+        // request through. There is no login endpoint: Access owns sign-in.
         if (p === '/api/parent/session') return parentSession(request, env);
 
-        const guard = await requireParent(request, env);
+        const guard = await requireParent(request);
         if (guard) return guard;
         if (request.method === 'GET') {
           if (p === '/api/parent/children') return parentChildren(env);
@@ -74,121 +73,38 @@ export default {
 
 /* ------------------------------------------------------------ parent access
 
-   Two accepted identities, checked in order:
+   Cloudflare Access is the ONLY parent authentication mechanism. The policy on
+   /parent* and /api/parent/* (One-time PIN, Allow list of the two parent email
+   addresses) authenticates at the edge, and every allowed request arrives with
+   an Access identity header. This Worker only reads that header.
 
-   1. Cloudflare Access — if a cf-access-* identity header is present the request
-      was already authenticated at the edge. Costs nothing to honour, so moving to
-      Access later (once a custom domain exists) needs no code change.
-   2. Passphrase session — PARENT_PASSCODE (a Cloudflare Secret) is exchanged once
-      for an HMAC-SHA256 signed, HttpOnly, Secure, SameSite=Strict cookie signed
-      with PARENT_SIGNING_KEY. The passcode never reaches browser JavaScript, and
-      neither value is ever in the repo.
+   There is no passcode, no signing key, no session cookie and no login form.
+   PARENT_PASSCODE / PARENT_SIGNING_KEY are not read anywhere.
 
-   Fails CLOSED: with no secrets configured, parent data is refused outright.   */
+   Fails CLOSED: a request with no Access identity gets 401 and no family data.
+   The public child wizard and /api/child/* never reach this code.            */
 
-const COOKIE = 'ffg_parent';
-const SESSION_DAYS = 30;
-
-const enc = new TextEncoder();
-const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-
-async function hmac(key, msg) {
-  const k = await crypto.subtle.importKey('raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  return b64url(await crypto.subtle.sign('HMAC', k, enc.encode(msg)));
+function accessEmail(request) {
+  return request.headers.get('cf-access-authenticated-user-email') || '';
 }
 
-// Length-independent comparison — no early exit on the first differing byte.
-function safeEqual(a, b) {
-  const A = enc.encode(String(a)), B = enc.encode(String(b));
-  let diff = A.length ^ B.length;
-  const n = Math.max(A.length, B.length);
-  for (let i = 0; i < n; i++) diff |= (A[i] || 0) ^ (B[i] || 0);
-  return diff === 0;
+function isParent(request) {
+  return !!(accessEmail(request) || request.headers.get('cf-access-jwt-assertion'));
 }
 
-function readCookie(request, name) {
-  const raw = request.headers.get('cookie') || '';
-  for (const part of raw.split(';')) {
-    const [k, ...v] = part.trim().split('=');
-    if (k === name) return decodeURIComponent(v.join('='));
-  }
-  return null;
+async function requireParent(request) {
+  if (isParent(request)) return null;
+  return json({
+    success: false,
+    code: 'auth_required',
+    message: 'Sign in through Cloudflare Access to view the family profiles.',
+  }, 401);
 }
 
-function signingKey(env) {
-  // Falls back to the passcode so a single secret is enough to run securely.
-  return env.PARENT_SIGNING_KEY || env.PARENT_PASSCODE || '';
-}
-
-async function makeToken(env) {
-  const exp = Date.now() + SESSION_DAYS * 86400000;
-  const payload = b64url(enc.encode(JSON.stringify({ exp })));
-  return payload + '.' + (await hmac(signingKey(env), payload));
-}
-
-async function validToken(env, token) {
-  if (!token || token.indexOf('.') < 0) return false;
-  const [payload, sig] = token.split('.');
-  const expect = await hmac(signingKey(env), payload);
-  if (!safeEqual(sig, expect)) return false;
-  try {
-    const { exp } = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
-    return typeof exp === 'number' && Date.now() < exp;
-  } catch { return false; }
-}
-
-function parentConfigured(env) { return !!(env.PARENT_PASSCODE && String(env.PARENT_PASSCODE).length >= 6); }
-
-async function isParent(request, env) {
-  if (request.headers.get('cf-access-authenticated-user-email') || request.headers.get('cf-access-jwt-assertion')) return true;
-  if (!parentConfigured(env)) return false;
-  return validToken(env, readCookie(request, COOKIE));
-}
-
-async function requireParent(request, env) {
-  if (!parentConfigured(env)) {
-    return json({ success: false, code: 'not_configured', message: 'Parent access is not configured yet. Set the PARENT_PASSCODE secret in Cloudflare.' }, 503);
-  }
-  if (await isParent(request, env)) return null;
-  return json({ success: false, code: 'auth_required', message: 'Parent sign-in required.' }, 401);
-}
-
-async function parentLogin(request, env) {
-  if (!parentConfigured(env)) return json({ success: false, code: 'not_configured', message: 'Parent access is not configured yet. Set the PARENT_PASSCODE secret in Cloudflare.' }, 503);
-  let body;
-  try { body = await request.json(); } catch { return json({ success: false, message: 'Invalid request.' }, 400); }
-  const given = String((body && body.passcode) || '');
-  if (!given) return json({ success: false, message: 'Enter the family passcode.' }, 400);
-
-  // Constant delay on every attempt: no timing signal, and brute force is slow.
-  await new Promise((r) => setTimeout(r, 400));
-  if (!safeEqual(given, String(env.PARENT_PASSCODE))) {
-    return json({ success: false, message: 'That passcode is not right.' }, 401);
-  }
-  const token = await makeToken(env);
-  return new Response(JSON.stringify({ success: true, message: 'Signed in.' }), {
-    status: 200,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-      'set-cookie': COOKIE + '=' + encodeURIComponent(token) + '; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=' + SESSION_DAYS * 86400,
-    },
-  });
-}
-
-function parentLogout() {
-  return new Response(JSON.stringify({ success: true, message: 'Signed out.' }), {
-    status: 200,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-      'set-cookie': COOKIE + '=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0',
-    },
-  });
-}
-
-async function parentSession(request, env) {
-  return json({ success: true, configured: parentConfigured(env), authed: await isParent(request, env) });
+// The portal calls this once on load. 'configured' stays true — there is nothing
+// left to configure in the app; Access is configured in Cloudflare.
+function parentSession(request) {
+  return json({ success: true, configured: true, authed: isParent(request), email: accessEmail(request) || null });
 }
 
 /* --------------------------------------------------------- parent: reads */

@@ -119,23 +119,21 @@ wizard run is version 1 again, auto-approved. Reset is parent-only — there is 
 control anywhere on the child side. Children may edit during the wizard or submit a retake
 (`/?child=slug`), which always saves as a new pending version.
 
-### Parent authentication — REQUIRED before sharing the URL
+### Parent authentication — Cloudflare Access (the only mechanism)
 
-The portal fails **closed**: with no passcode set, `/api/parent/*` returns 503 and the
-portal shows a setup notice instead of any family data.
+Sign-in is handled entirely by **Cloudflare Access**, outside the application:
 
-1. Cloudflare dashboard → Workers & Pages → your Worker → **Settings → Variables and Secrets**.
-2. Add a **Secret** named `PARENT_PASSCODE` — the family passphrase. Long is better; 6 characters minimum.
-3. Add a second **Secret** named `PARENT_SIGNING_KEY` — any long random string (used to sign
-   sessions). Optional: without it the passcode signs its own sessions, which still works,
-   but a separate key means changing the passcode doesn't invalidate nothing else.
-4. Deploy. Visit `/parent` — you should get a sign-in card.
+- Application paths: `/parent*` and `/api/parent/*` on the Worker domain.
+- Policy: **Allow**, Include → *Emails* → the two parent addresses.
+- Login method: **One-time PIN**.
 
-How it works: the passcode is POSTed once to `/api/parent/login`, compared in constant
-time, and exchanged for an **HMAC-SHA256 signed, HttpOnly, Secure, SameSite=Strict**
-cookie lasting 30 days. The passcode never reaches browser JavaScript, and neither secret
-is ever in the repo. Every `/api/parent/*` read verifies the signature and expiry.
-`Sign out` clears the cookie. To revoke every device at once, change `PARENT_SIGNING_KEY`.
+The Worker reads only the Access identity header
+(`cf-access-authenticated-user-email`, or `cf-access-jwt-assertion`) and fails **closed**:
+a request without one gets `401` and no family data. There is no app password —
+`PARENT_PASSCODE` and `PARENT_SIGNING_KEY` are not read by any code and can be deleted
+from the Worker's secrets. `Sign out` links to `/cdn-cgi/access/logout`.
+
+The public child wizard and `/api/child/*` are outside the Access paths and stay public.
 
 ### Cloudflare Access (optional upgrade — needs a custom domain)
 
