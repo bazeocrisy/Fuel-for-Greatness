@@ -1,32 +1,33 @@
 {
-	// Fuel for Greatness — Cloudflare Worker + Static Assets
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "fuel-for-greatness",
-	"main": "worker.js",
-	"compatibility_date": "2025-08-01",
-
-	"assets": {
-		// Serve the repo root as the static site, minus everything in .assetsignore
-		"directory": "./",
-		"binding": "ASSETS",
-
-		// The Worker runs BEFORE static assets for API paths
-		"run_worker_first": [
-			"/api/*"
-		]
-	},
-
-	// Cloudflare D1 — Fuel for Greatness family database
-	"d1_databases": [
-		{
-			"binding": "DB",
-			"database_name": "fuel-for-greatness",
-			"database_id": "cdea26fd-92b5-4f6a-9d9d-11fea7c06278",
-			"remote": true
-		}
-	],
-
-	"observability": {
-		"enabled": true
-	}
+  // Fuel for Greatness — Cloudflare Worker + Static Assets
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fuel-for-greatness",
+  "main": "worker.js",
+  "compatibility_date": "2025-08-01",
+  "assets": {
+    // Serve the repo root as the static site, minus everything in .assetsignore
+    "directory": "./",
+    "binding": "ASSETS",
+    // TRUE, not a pattern list. A path list can only protect the spellings it
+    // literally matches: "//parent.html" matches none of "/parent", "/parent/*",
+    // "/parent.html", so Cloudflare would have served the portal shell straight
+    // from static assets and the Worker's normalizePath() + 308 redirect would
+    // never have run. With true, EVERY request enters worker.js first, which
+    // normalizes the path, bounces any alternate parent spelling to the canonical
+    // /parent so Cloudflare Access evaluates it, and falls through to
+    // env.ASSETS.fetch(request) for ordinary static files.
+    // Access, configured on /parent* and /api/parent/*, remains the only parent
+    // authentication mechanism.
+    "run_worker_first": true
+  },
+  // Cloudflare D1 — the family database. The id below is the real one for this
+  // project; it is an identifier, not a secret, and the GitHub build needs it.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fuel-for-greatness",
+      "database_id": "cdea26fd-92b5-4f6a-9d9d-11fea7c06278"
+    }
+  ],
+  "observability": { "enabled": true }
 }
