@@ -13,6 +13,11 @@
     // server for /parent.html, that redirect pointed the browser back at
     // /parent and produced ERR_TOO_MANY_REDIRECTS. With "none" the asset server
     // returns the file itself and the Worker owns all parent routing.
+    //
+    // The same setting also disables the implicit / -> /index.html lookup, which
+    // is why worker.js names BOTH shells explicitly (serveStaticShell): "/" and
+    // "/index.html" serve index.html, "/parent" serves parent.html. Neither app
+    // depends on asset-side HTML rewriting any more.
     "html_handling": "none",
     // TRUE, not a pattern list. A path list can only protect the spellings it
     // literally matches: "//parent.html" matches none of "/parent", "/parent/*",

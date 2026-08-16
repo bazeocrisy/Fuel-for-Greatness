@@ -14,7 +14,7 @@ schema.sql        D1 tables (apply once)
 seed.sql          children + food catalog (apply once, after schema)
 ```
 
-Current build: **2026.08.09-18**
+Current build: **2026.08.09-19**
 
 ## Deployment
 

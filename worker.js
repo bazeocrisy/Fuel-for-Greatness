@@ -2,7 +2,8 @@
  * Fuel for Greatness — Cloudflare Worker (Worker + Static Assets + D1)
  *
  * PUBLIC (no auth — a child's phone has no login)
- *   GET  /*                        static site via the ASSETS binding
+ *   GET  / , /index.html          child wizard shell, served internally from index.html
+ *   GET  /*                        other static files via the ASSETS binding
  *   POST /api/child/:slug/profile  save a completed food profile to D1
  *   GET  /api/child/:slug/status   {saved, lastCompletedAt, pending} — no food data
  *
@@ -37,11 +38,18 @@ export default {
        genuinely different spelling is redirected, and only ever once, to a
        target that is always served rather than bounced again.                 */
     if (isParentPath(p)) {
-      if (url.pathname === '/parent') return serveParentShell(env, url);
+      if (url.pathname === '/parent') return serveStaticShell(env, url, '/parent.html', 'Parent Portal', true);
       // A different spelling: one hop to the canonical path so Access sees it.
       // The target is /parent, which the branch above always serves.
       return Response.redirect(new URL('/parent', url.origin).toString(), 302);
     }
+
+    /* The child wizard shell. html_handling is "none", so the asset server no
+       longer maps / to /index.html — it 404s. The Worker therefore names the
+       file itself, exactly as it does for the portal, and never relies on asset
+       extension or trailing-slash rewriting. /index.html and /index collapse to
+       the same served body, so no spelling of the shell ever redirects.        */
+    if (isChildShellPath(p)) return serveStaticShell(env, url, '/index.html', 'app', false);
 
     if (p.startsWith('/api/')) {
       let m;
@@ -123,6 +131,12 @@ function isParentPath(p) {
   return p === '/parent' || p === '/parent.html' || p.startsWith('/parent/');
 }
 
+// True for every spelling of the public child shell. Whole-path matches only, so
+// /parentx-style near misses and real asset files are never captured here.
+function isChildShellPath(p) {
+  return p === '/' || p === '/index.html' || p === '/index';
+}
+
 /* Access already proves WHO is calling; this proves the call came from our own
    page rather than another site riding the Access cookie. Applied to the
    destructive POSTs only. */
@@ -135,23 +149,29 @@ function crossOrigin(request, url) {
   return json({ success: false, message: 'Request blocked: unexpected origin.' }, 403);
 }
 
-/* Returns the portal shell as a BODY, never as a redirect.
+/* Returns an application shell as a BODY, never as a redirect.
 
    Cloudflare Static Assets applies html_handling to asset lookups: a request for
    /parent.html is normally answered with a redirect to the extensionless
    /parent. Passing that response through would send the browser back to /parent,
-   which lands here again — an endless cycle. wrangler.jsonc now sets
+   which lands here again — an endless cycle. wrangler.jsonc sets
    html_handling:"none", and this function additionally absorbs any 3xx the asset
    server might still produce, following it internally so the browser only ever
-   receives HTML. Belt and braces: a redirect can never escape this function.  */
-async function serveParentShell(env, url) {
-  let target = new URL('/parent.html', url.origin);
+   receives HTML. Belt and braces: a redirect can never escape this function.
+
+   The same routine serves the public child shell (/index.html): html_handling
+   "none" also disables the implicit / -> /index.html lookup, so naming the file
+   here is what makes / work without re-enabling the rewrite that caused the loop.
+
+   noStore applies to the authenticated portal only; the public shell keeps the
+   asset server's own caching headers.                                         */
+async function serveStaticShell(env, url, file, label, noStore) {
+  let target = new URL(file, url.origin);
   for (let hop = 0; hop < 3; hop++) {
     const res = await env.ASSETS.fetch(new Request(target.toString(), { method: 'GET' }));
     if (res.status < 300 || res.status >= 400) {
-      // Copy out so we can guarantee no-store on the authenticated shell.
       const out = new Response(res.body, res);
-      out.headers.set('cache-control', 'no-store');
+      if (noStore) out.headers.set('cache-control', 'no-store');
       return out;
     }
     const loc = res.headers.get('location');
@@ -160,7 +180,7 @@ async function serveParentShell(env, url) {
     if (next.pathname === target.pathname) break;   // pointing at itself
     target = next;
   }
-  return new Response('The Parent Portal could not be loaded.', {
+  return new Response('The ' + label + ' could not be loaded.', {
     status: 500, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
   });
 }
